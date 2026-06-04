@@ -1,0 +1,15 @@
+#!/bin/sh
+# Block commits that contain a real Apple Developer Team ID.
+# DEVELOPMENT_TEAM = ""; is allowed. A real 10-character ID is not.
+
+found=$(git diff --cached --unified=0 | grep -E '^\+.*DEVELOPMENT_TEAM = [A-Z0-9]{8,10}[^"]')
+
+if [ -n "$found" ]; then
+    echo ""
+    echo "ERROR: Apple Developer Team ID found in staged changes:"
+    echo "$found"
+    echo ""
+    echo "Fix: set DEVELOPMENT_TEAM = \"\" in the affected file(s), then re-stage."
+    echo ""
+    exit 1
+fi
