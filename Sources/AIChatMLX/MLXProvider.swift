@@ -6,6 +6,8 @@ import MLXHuggingFace
 import HuggingFace
 import Tokenizers
 
+// MARK: - MLXProvider
+
 /// ChatProvider that runs inference on-device via Apple MLX.
 ///
 /// Models are downloaded from Hugging Face Hub on first use and cached in the system's
@@ -14,65 +16,32 @@ import Tokenizers
 /// Requires Apple Silicon (M-series Mac or A-series iPhone/iPad). MLX will not run
 /// meaningfully on Intel or Simulator targets.
 ///
-/// ### Quick start
-/// ```swift
-/// let provider = MLXProvider()   // uses mlx-community/gemma-4-e4b-it-4bit
-/// let session  = ChatSession(provider: provider, model: "")
-/// session.send("Hello")
-/// ```
-///
-/// ### Custom model
-/// ```swift
-/// let provider = MLXProvider(modelId: "mlx-community/Qwen3-1.7B-4bit")
-/// ```
-///
-/// ### Pre-downloaded model
-/// ```swift
-/// let provider = MLXProvider(modelPath: URL(fileURLWithPath: "/path/to/model-dir"))
-/// ```
-///
-/// The `model` parameter on `ChatSession` is not used by `MLXProvider`; the model is
-/// determined at init time. Pass any non-empty string (e.g. `""`).
+/// Tool use uses Gemma 4's native format — tools are declared via the chat template's
+/// `tools=` parameter and the model outputs `<|tool_call>call:name{...}<tool_call|>` tokens.
+/// Pass tools via `ChatRequestOptions.nativeToolSpecs`.
 public actor MLXProvider: ChatProvider {
 
     // MARK: - Default model
 
-    /// Default model: Gemma 4 E4B instruction-tuned, 4-bit quantized.
-    ///
-    /// This is the smallest Gemma 4 variant with vision support stripped (text-only via
-    /// mlx-community). It runs comfortably on MacBook Air M-series and A-series iPhones.
-    /// The model is approximately 2.5 GB on disk after download.
-    ///
-    /// Available quantisation variants on mlx-community if you need a different size/quality:
-    /// - `mlx-community/gemma-4-e4b-it-4bit`  (default, ~2.5 GB)
-    /// - `mlx-community/gemma-4-e4b-it-8bit`  (~4.5 GB)
-    /// - `mlx-community/gemma-4-e4b-it-bf16`  (~8 GB, full precision)
     public static let defaultModelId = "mlx-community/gemma-4-e4b-it-4bit"
 
     // MARK: - ChatProvider identity
 
     public nonisolated let id   = "mlx"
     public nonisolated let name = "MLX"
+    public nonisolated var zeroResponseMessage: String {
+        "No response from on-device model — try resending, or reload the model if it seems stuck"
+    }
 
     // MARK: - Configuration
 
-    // nonisolated: immutable constants, safe to read without an actor hop
     nonisolated private let configuration:      ModelConfiguration
     nonisolated private let generateParameters: GenerateParameters
     private var container:                      ModelContainer?
+    private var loadedAdapter:                  LoRAContainer?
 
     // MARK: - Init
 
-    /// Create an MLXProvider with a Hugging Face Hub model ID.
-    ///
-    /// The model is downloaded to the system caches directory on first use.
-    ///
-    /// - Parameters:
-    ///   - modelId: Hugging Face repo ID. Defaults to `mlx-community/gemma-4-e4b-it-4bit`.
-    ///   - maxTokens: Maximum tokens to generate. `nil` = unlimited.
-    ///   - temperature: Sampling temperature (default 0.6).
-    ///   - topP: Top-p nucleus sampling threshold (default 1.0).
-    ///   - repetitionPenalty: Penalty for repeating recent tokens. `nil` = disabled.
     public init(
         modelId: String = MLXProvider.defaultModelId,
         maxTokens: Int? = nil,
@@ -89,12 +58,6 @@ public actor MLXProvider: ChatProvider {
         )
     }
 
-    /// Create an MLXProvider from a pre-downloaded local model directory.
-    ///
-    /// The directory must contain `config.json`, model weight shards, and tokenizer files
-    /// (the standard layout produced by `mlx_lm.convert` or downloaded from mlx-community).
-    ///
-    /// - Parameter modelPath: URL of the directory containing the model files.
     public init(
         modelPath: URL,
         maxTokens: Int? = nil,
@@ -113,12 +76,6 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - Model management
 
-    /// Load (and if needed, download) the model.
-    ///
-    /// Called automatically on the first `stream()` or `complete()` call.
-    /// Call this explicitly with a progress handler to show download UI before starting a chat.
-    ///
-    /// - Parameter progressHandler: Receives a `Progress` object during Hub download.
     public func loadModel(
         progressHandler: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
@@ -149,16 +106,12 @@ public actor MLXProvider: ChatProvider {
                     }
 
                     let params      = self.generateParameters
-                    let mlxMessages: [[String: any Sendable]] = Self.toMLXMessages(
-                        messages: messages, systemPrompt: options.systemPrompt)
+                    let toolSpecs   = Self.toToolSpecs(options.tools)
+                    let mlxMessages = Self.toMLXMessages(messages: messages, systemPrompt: options.systemPrompt)
 
-                    // ModelContainer.perform provides thread-safe access to the underlying
-                    // ModelContext. All heavy work — prompt preparation and the generation
-                    // loop — happens inside this closure.
                     let completionInfo: GenerateCompletionInfo? = try await container.perform { @Sendable ctx in
-                        let userInput = UserInput(messages: mlxMessages)
+                        let userInput = UserInput(messages: mlxMessages, tools: toolSpecs)
                         let lmInput   = try await ctx.processor.prepare(input: userInput)
-                        // cache: nil — let MLX manage the KV cache internally.
                         let stream    = try MLXLMCommon.generate(
                             input: lmInput,
                             cache: nil,
@@ -166,24 +119,54 @@ public actor MLXProvider: ChatProvider {
                             context: ctx
                         )
 
-                        var info: GenerateCompletionInfo? = nil
+                        let processor = ToolCallProcessor(format: .gemma, tools: toolSpecs)
+                        var emittedToolCallCount = 0
+                        var info: GenerateCompletionInfo?
+
                         for await generation in stream {
                             guard !Task.isCancelled else { break }
+
                             if let chunk = generation.chunk, !chunk.isEmpty {
-                                continuation.yield(.text(chunk))
+                                // processChunk returns displayable text (nil while buffering a tool call)
+                                if let text = processor.processChunk(chunk), !text.isEmpty {
+                                    continuation.yield(.text(text))
+                                }
+                                // Emit any newly completed tool calls
+                                let newCalls = processor.toolCalls.dropFirst(emittedToolCallCount)
+                                for tc in newCalls {
+                                    let argsJSON = Self.serializeArguments(tc.function.arguments)
+                                    continuation.yield(.toolCallComplete(
+                                        id: UUID().uuidString,
+                                        name: tc.function.name,
+                                        arguments: argsJSON
+                                    ))
+                                }
+                                emittedToolCallCount = processor.toolCalls.count
                             }
-                            if let genInfo = generation.info {
-                                info = genInfo
-                            }
+
+                            if let genInfo = generation.info { info = genInfo }
                         }
+
+                        // Flush anything remaining at EOS
+                        processor.processEOS()
+                        let finalCalls = processor.toolCalls.dropFirst(emittedToolCallCount)
+                        for tc in finalCalls {
+                            let argsJSON = Self.serializeArguments(tc.function.arguments)
+                            continuation.yield(.toolCallComplete(
+                                id: UUID().uuidString,
+                                name: tc.function.name,
+                                arguments: argsJSON
+                            ))
+                        }
+
                         return info
                     }
 
                     if let info = completionInfo {
                         continuation.yield(.usage(TokenUsage(
-                            promptTokens:      info.promptTokenCount,
-                            completionTokens:  info.generationTokenCount,
-                            totalTokens:       info.promptTokenCount + info.generationTokenCount
+                            promptTokens:     info.promptTokenCount,
+                            completionTokens: info.generationTokenCount,
+                            totalTokens:      info.promptTokenCount + info.generationTokenCount
                         )))
                     }
 
@@ -204,7 +187,7 @@ public actor MLXProvider: ChatProvider {
         options: ChatRequestOptions
     ) async throws -> ChatCompletionResult {
         var fullText = ""
-        var usage: TokenUsage? = nil
+        var usage: TokenUsage?
         for try await event in stream(messages: messages, model: model, options: options) {
             switch event {
             case .text(let delta): fullText += delta
@@ -221,19 +204,52 @@ public actor MLXProvider: ChatProvider {
         )
     }
 
-    // MARK: - Helpers
+    // MARK: - Persona adapter management
+
+    public func loadAdapter(at path: URL) async throws {
+        guard let container else {
+            throw ChatError.invalidConfiguration("Model must be loaded before loading an adapter.")
+        }
+        if loadedAdapter != nil { try await unloadAdapter() }
+        let adapter = try LoRAContainer.from(directory: path)
+        _ = try await container.perform { ctx in
+            try adapter.load(into: ctx.model)
+        }
+        loadedAdapter = adapter
+        print("[MLXProvider] Adapter loaded from \(path.lastPathComponent)")
+    }
+
+    public func unloadAdapter() async throws {
+        guard let adapter = loadedAdapter, let container else { return }
+        _ = await container.perform { ctx in
+            adapter.unload(from: ctx.model)
+        }
+        loadedAdapter = nil
+        print("[MLXProvider] Adapter unloaded")
+    }
+
+    // MARK: - Private helpers
 
     private func ensureLoaded() async throws {
         guard container == nil else { return }
         try await loadModel()
     }
 
-    /// Converts `[ChatMessage]` to the `[UserInput.Message]` format MLX expects.
+    /// Serialise `[String: JSONValue]` tool call arguments back to a JSON string.
+    private static func serializeArguments(_ args: [String: JSONValue]) -> String {
+        let plain = args.mapValues { $0.anyValue }
+        guard let data = try? JSONSerialization.data(withJSONObject: plain),
+              let str  = String(data: data, encoding: .utf8)
+        else { return "{}" }
+        return str
+    }
+
+    /// Convert `[ChatMessage]` to the `[[String: any Sendable]]` format MLX expects.
     ///
-    /// `UserInput.Message` is `[String: any Sendable]`. The chat template is applied by
-    /// `context.processor.prepare(input:)` using the model's built-in tokenizer template,
-    /// so no manual template formatting is needed here.
-    // MLXLMCommon.Message = [String: any Sendable] (module-level typealias, not UserInput.Message)
+    /// - Tool-result messages (`role == .tool`) are passed with `tool_call_id` so the
+    ///   chat template's forward-scan picks them up from the preceding assistant message.
+    /// - Assistant messages with `toolCalls` use a `tool_calls` array (not plain text),
+    ///   so the template renders `<|tool_call>...<tool_call|>` and inlines the response.
     private static func toMLXMessages(
         messages: [ChatMessage],
         systemPrompt: String?
@@ -245,15 +261,95 @@ public actor MLXProvider: ChatProvider {
         }
 
         for message in messages {
-            let parts = message.content.compactMap { block -> String? in
-                guard case .text(let t) = block else { return nil }
-                return t
+
+            // --- Tool-result messages ---
+            if message.role == .tool {
+                let text = message.content.compactMap {
+                    if case .text(let t) = $0 { return t } else { return nil }
+                }.joined(separator: "\n")
+
+                var msg: [String: any Sendable] = [
+                    "role":    "tool"   as any Sendable,
+                    "content": text     as any Sendable
+                ]
+                if let tid = message.toolCallId {
+                    msg["tool_call_id"] = tid as any Sendable
+                }
+                result.append(msg)
+                continue
+            }
+
+            // --- Assistant messages with tool calls (native format) ---
+            if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                let nativeCalls: [any Sendable] = toolCalls.compactMap { tc -> [String: any Sendable]? in
+                    guard let argData = tc.arguments.data(using: .utf8),
+                          let argObj  = try? JSONSerialization.jsonObject(with: argData) as? [String: Any]
+                    else { return nil }
+                    return [
+                        "id":   tc.id   as any Sendable,
+                        "type": "function" as any Sendable,
+                        "function": [
+                            "name":      tc.name as any Sendable,
+                            "arguments": Self.toSendable(argObj) as any Sendable
+                        ] as [String: any Sendable] as any Sendable
+                    ]
+                }
+                guard !nativeCalls.isEmpty else { continue }
+                result.append([
+                    "role":       "assistant" as any Sendable,
+                    "content":    ""          as any Sendable,
+                    "tool_calls": nativeCalls as any Sendable
+                ])
+                continue
+            }
+
+            // --- All other messages (plain text) ---
+            let parts = message.content.compactMap {
+                if case .text(let t) = $0 { return t } else { return nil }
             }
             guard !parts.isEmpty else { continue }
-            let content = parts.joined(separator: "\n")
-            result.append(["role": message.role.rawValue as any Sendable, "content": content as any Sendable])
+            result.append([
+                "role":    message.role.rawValue as any Sendable,
+                "content": parts.joined(separator: "\n") as any Sendable
+            ])
         }
 
         return result
+    }
+
+    /// Convert `ChatRequestOptions.ToolDefinition` array to the `[ToolSpec]` format expected by MLXLMCommon.
+    private static func toToolSpecs(_ tools: [ChatRequestOptions.ToolDefinition]?) -> [ToolSpec]? {
+        guard let tools, !tools.isEmpty else { return nil }
+        let encoder = JSONEncoder()
+        return tools.compactMap { tool -> ToolSpec? in
+            var function: [String: any Sendable] = ["name": tool.name]
+            if let desc = tool.description { function["description"] = desc }
+            if let params = tool.parameters,
+               let data = try? encoder.encode(params),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                function["parameters"] = toSendable(dict)
+            }
+            return ["type": "function", "function": function]
+        }
+    }
+
+    /// Recursively convert `[String: Any]` (from JSONSerialization) to `[String: any Sendable]`.
+    private static func toSendable(_ dict: [String: Any]) -> [String: any Sendable] {
+        dict.compactMapValues { value -> (any Sendable)? in
+            if let d = value as? [String: Any] { return toSendable(d) }
+            if let a = value as? [Any]         { return a.compactMap { v -> (any Sendable)? in
+                if let d = v as? [String: Any] { return toSendable(d) }
+                if let s = v as? String { return s }
+                if let b = v as? Bool { return b }
+                if let n = v as? Double { return n }
+                if let n = v as? Int { return n }
+                return nil
+            }}
+            if let s = value as? String        { return s }
+            if let b = value as? Bool          { return b }
+            if let n = value as? Double        { return n }
+            if let n = value as? Int           { return n }
+            return nil
+        }
     }
 }

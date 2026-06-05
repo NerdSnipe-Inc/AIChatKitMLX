@@ -22,7 +22,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/NerdSnipe-Inc/AIChatKit.git", from: "0.1.0"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm",           .upToNextMajor(from: "3.0.0")),
+        .package(path: "../mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git",  .upToNextMajor(from: "0.9.0")),
         .package(url: "https://github.com/huggingface/swift-transformers",     .upToNextMajor(from: "1.2.1")),
     ],
