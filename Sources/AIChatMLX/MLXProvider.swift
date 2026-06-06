@@ -119,44 +119,54 @@ public actor MLXProvider: ChatProvider {
                             context: ctx
                         )
 
-                        let processor = ToolCallProcessor(format: .gemma, tools: toolSpecs)
-                        var emittedToolCallCount = 0
+                        var processor = Gemma4StreamProcessor(tools: toolSpecs)
                         var info: GenerateCompletionInfo?
 
                         for await generation in stream {
                             guard !Task.isCancelled else { break }
 
+                            if let nativeCall = generation.toolCall {
+                                let argsJSON = Self.serializeArguments(nativeCall.function.arguments)
+                                continuation.yield(.toolCallComplete(
+                                    id: UUID().uuidString,
+                                    name: nativeCall.function.name,
+                                    arguments: argsJSON
+                                ))
+                            }
+
                             if let chunk = generation.chunk, !chunk.isEmpty {
-                                // processChunk returns displayable text (nil while buffering a tool call)
-                                if let text = processor.processChunk(chunk), !text.isEmpty {
-                                    continuation.yield(.text(text))
+                                for event in processor.processChunk(chunk) {
+                                    switch event {
+                                    case .reasoning(let delta):
+                                        if !delta.isEmpty { continuation.yield(.reasoning(delta)) }
+                                    case .text(let text):
+                                        if !text.isEmpty { continuation.yield(.text(text)) }
+                                    case .toolCall(let name, let argsJSON):
+                                        continuation.yield(.toolCallComplete(
+                                            id: UUID().uuidString,
+                                            name: name,
+                                            arguments: argsJSON
+                                        ))
+                                    }
                                 }
-                                // Emit any newly completed tool calls
-                                let newCalls = processor.toolCalls.dropFirst(emittedToolCallCount)
-                                for tc in newCalls {
-                                    let argsJSON = Self.serializeArguments(tc.function.arguments)
-                                    continuation.yield(.toolCallComplete(
-                                        id: UUID().uuidString,
-                                        name: tc.function.name,
-                                        arguments: argsJSON
-                                    ))
-                                }
-                                emittedToolCallCount = processor.toolCalls.count
                             }
 
                             if let genInfo = generation.info { info = genInfo }
                         }
 
-                        // Flush anything remaining at EOS
-                        processor.processEOS()
-                        let finalCalls = processor.toolCalls.dropFirst(emittedToolCallCount)
-                        for tc in finalCalls {
-                            let argsJSON = Self.serializeArguments(tc.function.arguments)
-                            continuation.yield(.toolCallComplete(
-                                id: UUID().uuidString,
-                                name: tc.function.name,
-                                arguments: argsJSON
-                            ))
+                        for event in processor.finish() {
+                            switch event {
+                            case .reasoning(let delta):
+                                if !delta.isEmpty { continuation.yield(.reasoning(delta)) }
+                            case .text(let text):
+                                if !text.isEmpty { continuation.yield(.text(text)) }
+                            case .toolCall(let name, let argsJSON):
+                                continuation.yield(.toolCallComplete(
+                                    id: UUID().uuidString,
+                                    name: name,
+                                    arguments: argsJSON
+                                ))
+                            }
                         }
 
                         return info
@@ -327,7 +337,8 @@ public actor MLXProvider: ChatProvider {
             if let params = tool.parameters,
                let data = try? encoder.encode(params),
                let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                function["parameters"] = toSendable(dict)
+                let safe = GemmaJinjaToolSchema.sanitizeParameters(dict)
+                function["parameters"] = toSendable(safe)
             }
             return ["type": "function", "function": function]
         }
