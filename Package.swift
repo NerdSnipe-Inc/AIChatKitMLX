@@ -1,18 +1,31 @@
 // swift-tools-version: 5.10
 
+import Foundation
 import PackageDescription
 
-// AIChatKitMLX adds on-device Apple MLX inference (Apple Silicon only) to any app
-// that already uses AIChatKit. Models are downloaded from Hugging Face Hub on first use.
-//
-// Usage:
-//   .package(url: "https://github.com/NerdSnipe-Inc/AIChatKit",    from: "0.1.0"),
-//   .package(url: "https://github.com/NerdSnipe-Inc/AIChatKitMLX", from: "0.1.0"),
-//
-// Requires Apple Silicon. Do not add this target to builds that must run on Intel or Simulator.
-//
-// mlx-swift-lm is pinned to 3.x — Gemma 4 architecture support was added in 3.0.
-// The 3.x series brings in swift-syntax 600.x; this resolves cleanly on Swift 6.3+.
+// Monorepo: sibling packages when present next to this repo (Alric layout).
+// SPI / standalone clone: GitHub URLs when SPI_PROCESSING is set or sibling missing.
+
+private let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+
+private func siblingOrRemote(
+    siblingRelativePath: String,
+    url: String,
+    from version: Version
+) -> Package.Dependency {
+    let siblingManifest = packageDirectory
+        .appendingPathComponent(siblingRelativePath)
+        .standardized
+        .appendingPathComponent("Package.swift")
+
+    let forceRemote = ProcessInfo.processInfo.environment["SPI_PROCESSING"] != nil
+        || ProcessInfo.processInfo.environment["FORCE_REMOTE_PACKAGES"] != nil
+
+    if !forceRemote, FileManager.default.fileExists(atPath: siblingManifest.path) {
+        return .package(path: siblingRelativePath)
+    }
+    return .package(url: url, from: version)
+}
 
 let package = Package(
     name: "AIChatKitMLX",
@@ -21,22 +34,30 @@ let package = Package(
         .library(name: "AIChatMLX", targets: ["AIChatMLX"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/NerdSnipe-Inc/AIChatKit.git", from: "0.1.0"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.0.0"),
-        .package(url: "https://github.com/huggingface/swift-huggingface.git",  .upToNextMajor(from: "0.9.0")),
+        siblingOrRemote(
+            siblingRelativePath: "../AIChatKit",
+            url: "https://github.com/NerdSnipe-Inc/AIChatKit.git",
+            from: "1.0.0"
+        ),
+        siblingOrRemote(
+            siblingRelativePath: "../mlx-swift-lm",
+            url: "https://github.com/ml-explore/mlx-swift-lm.git",
+            from: "3.0.0"
+        ),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.9.0")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.2.1")),
     ],
     targets: [
         .target(
             name: "AIChatMLX",
             dependencies: [
-                .product(name: "AIChatCore",     package: "AIChatKit"),
-                .product(name: "MLXLLM",         package: "mlx-swift-lm"),
-                .product(name: "MLXVLM",         package: "mlx-swift-lm"),
-                .product(name: "MLXLMCommon",    package: "mlx-swift-lm"),
+                .product(name: "AIChatCore", package: "AIChatKit"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
-                .product(name: "HuggingFace",    package: "swift-huggingface"),
-                .product(name: "Tokenizers",     package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/AIChatMLX"
         ),
