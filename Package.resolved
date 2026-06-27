@@ -1,6 +1,15 @@
 {
-  "originHash" : "6a2d9181bf11e68cf24beffc3854de025d107c8f0df2076f3daf89778f8326f7",
+  "originHash" : "6a54f50cef6f3392678e12649949245710a4b71fa352ac65843e1ff0fbf9108c",
   "pins" : [
+    {
+      "identity" : "aichatkit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/NerdSnipe-Inc/AIChatKit.git",
+      "state" : {
+        "revision" : "ca579e32490b62ed5be2c8954c6b9f69f6fc1020",
+        "version" : "0.1.0"
+      }
+    },
     {
       "identity" : "eventsource",
       "kind" : "remoteSourceControl",
@@ -17,6 +26,15 @@
       "state" : {
         "revision" : "dc43e62d7055353c7f99fa071a4e71d29dfddc44",
         "version" : "0.31.4"
+      }
+    },
+    {
+      "identity" : "mlx-swift-lm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ml-explore/mlx-swift-lm.git",
+      "state" : {
+        "revision" : "1c05248bb0899e2a7a4962b84d319cf12f4e12aa",
+        "version" : "3.31.3"
       }
     },
     {
