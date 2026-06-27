@@ -1,6 +1,7 @@
 import Foundation
 import AIChatCore
 import MLXLLM
+import MLXVLM
 import MLXLMCommon
 import MLXHuggingFace
 import HuggingFace
@@ -21,9 +22,22 @@ import Tokenizers
 /// Pass tools via `ChatRequestOptions.nativeToolSpecs`.
 public actor MLXProvider: ChatProvider {
 
-    // MARK: - Default model
+    // MARK: - Model selection
 
-    public static let defaultModelId = "mlx-community/gemma-4-e4b-it-4bit"
+    /// Small text-only model — fits on any Apple Silicon device (≥ 8 GB RAM).
+    public static let smallModelId = "mlx-community/gemma-4-e4b-it-4bit"
+
+    /// Large text model — Qwen 2.5 7B Instruct (4-bit), strong reasoning and instruction following.
+    /// Requires ≥ 16 GB RAM (downloads ~4.5 GB).
+    public static let largeModelId = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+
+    /// Always returns the small model — the large model is opt-in via Model Manager only.
+    public static func recommendedModelId() -> String {
+        return smallModelId
+    }
+
+    /// Convenience: `defaultModelId` now resolves to the recommended model for this device.
+    public static var defaultModelId: String { recommendedModelId() }
 
     // MARK: - ChatProvider identity
 
@@ -81,7 +95,10 @@ public actor MLXProvider: ChatProvider {
     ) async throws {
         guard container == nil else { return }
         let handler = progressHandler ?? { _ in }
-        container = try await LLMModelFactory.shared.loadContainer(
+        // loadModelContainer is the MLXLMCommon free function — it tries MLXVLM's factory
+        // first, then MLXLLM, automatically routing to the right architecture.
+        // Importing MLXVLM above is required to register its TrampolineModelFactory.
+        container = try await loadModelContainer(
             from: #hubDownloader(),
             using: #huggingFaceTokenizerLoader(),
             configuration: configuration,
@@ -106,7 +123,7 @@ public actor MLXProvider: ChatProvider {
                     }
 
                     let params      = self.generateParameters
-                    let toolSpecs   = Self.toToolSpecs(options.tools)
+                    let toolSpecs   = Self.toToolSpecs(options.tools) ?? options.nativeToolSpecs
                     let mlxMessages = Self.toMLXMessages(messages: messages, systemPrompt: options.systemPrompt)
 
                     let completionInfo: GenerateCompletionInfo? = try await container.perform { @Sendable ctx in
@@ -260,7 +277,7 @@ public actor MLXProvider: ChatProvider {
     ///   chat template's forward-scan picks them up from the preceding assistant message.
     /// - Assistant messages with `toolCalls` use a `tool_calls` array (not plain text),
     ///   so the template renders `<|tool_call>...<tool_call|>` and inlines the response.
-    private static func toMLXMessages(
+    static func toMLXMessages(
         messages: [ChatMessage],
         systemPrompt: String?
     ) -> [[String: any Sendable]] {
@@ -273,19 +290,18 @@ public actor MLXProvider: ChatProvider {
         for message in messages {
 
             // --- Tool-result messages ---
+            // Gemma 4's Jinja template enforces strict user/assistant alternation and
+            // throws a TemplateException on role:"tool". Inject tool results as user
+            // turns so the alternation is preserved: user → assistant(tool_calls) → user(result) → assistant.
             if message.role == .tool {
                 let text = message.content.compactMap {
                     if case .text(let t) = $0 { return t } else { return nil }
                 }.joined(separator: "\n")
 
-                var msg: [String: any Sendable] = [
-                    "role":    "tool"   as any Sendable,
-                    "content": text     as any Sendable
-                ]
-                if let tid = message.toolCallId {
-                    msg["tool_call_id"] = tid as any Sendable
-                }
-                result.append(msg)
+                result.append([
+                    "role":    "user" as any Sendable,
+                    "content": text   as any Sendable
+                ])
                 continue
             }
 
@@ -318,6 +334,16 @@ public actor MLXProvider: ChatProvider {
                 if case .text(let t) = $0 { return t } else { return nil }
             }
             guard !parts.isEmpty else { continue }
+
+            // Gemma enforces strict user/assistant alternation.
+            // When the model emits text + inline tool call, ChatSession writes two
+            // consecutive assistant entries to history (tool_calls first, then text).
+            // Drop the text-only one — Gemma only needs the tool_calls assistant turn.
+            if message.role == .assistant,
+               result.last?["role"] as? String == "assistant" {
+                continue
+            }
+
             result.append([
                 "role":    message.role.rawValue as any Sendable,
                 "content": parts.joined(separator: "\n") as any Sendable

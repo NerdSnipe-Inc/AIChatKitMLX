@@ -21,7 +21,7 @@ let package = Package(
         .library(name: "AIChatMLX", targets: ["AIChatMLX"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/NerdSnipe-Inc/AIChatKit.git", from: "0.1.0"),
+        .package(path: "../AIChatKit"),
         .package(path: "../mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git",  .upToNextMajor(from: "0.9.0")),
         .package(url: "https://github.com/huggingface/swift-transformers",     .upToNextMajor(from: "1.2.1")),
@@ -32,6 +32,7 @@ let package = Package(
             dependencies: [
                 .product(name: "AIChatCore",     package: "AIChatKit"),
                 .product(name: "MLXLLM",         package: "mlx-swift-lm"),
+                .product(name: "MLXVLM",         package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon",    package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace",    package: "swift-huggingface"),
