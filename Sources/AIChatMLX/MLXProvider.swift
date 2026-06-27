@@ -41,8 +41,11 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - ChatProvider identity
 
+    /// Provider identifier used by `AIChatCore`.
     public nonisolated let id   = "mlx"
+    /// Human-readable provider display name.
     public nonisolated let name = "MLX"
+    /// Fallback message returned when the model stream yields no text.
     public nonisolated var zeroResponseMessage: String {
         "No response from on-device model — try resending, or reload the model if it seems stuck"
     }
@@ -56,6 +59,14 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - Init
 
+    /// Creates a provider that loads a model by Hugging Face model id.
+    ///
+    /// - Parameters:
+    ///   - modelId: Hub model id or repo slug resolvable by MLX.
+    ///   - maxTokens: Optional generation token limit for completions.
+    ///   - temperature: Sampling temperature for generation.
+    ///   - topP: Nucleus sampling probability mass.
+    ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     public init(
         modelId: String = MLXProvider.defaultModelId,
         maxTokens: Int? = nil,
@@ -72,6 +83,14 @@ public actor MLXProvider: ChatProvider {
         )
     }
 
+    /// Creates a provider that loads a model from a local directory.
+    ///
+    /// - Parameters:
+    ///   - modelPath: Local filesystem path to an MLX-compatible model directory.
+    ///   - maxTokens: Optional generation token limit for completions.
+    ///   - temperature: Sampling temperature for generation.
+    ///   - topP: Nucleus sampling probability mass.
+    ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     public init(
         modelPath: URL,
         maxTokens: Int? = nil,
@@ -90,6 +109,9 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - Model management
 
+    /// Loads the configured model into memory if it is not already loaded.
+    ///
+    /// - Parameter progressHandler: Optional callback receiving download/load progress updates.
     public func loadModel(
         progressHandler: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
@@ -108,6 +130,13 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - ChatProvider
 
+    /// Streams completion events from the on-device model.
+    ///
+    /// - Parameters:
+    ///   - messages: Conversation history to send to the model.
+    ///   - model: Requested model identifier from caller context.
+    ///   - options: Per-request options including tools and system prompt.
+    /// - Returns: Async stream of text, reasoning, tool-call, usage, and completion events.
     public nonisolated func stream(
         messages: [ChatMessage],
         model: String,
@@ -208,6 +237,13 @@ public actor MLXProvider: ChatProvider {
         }
     }
 
+    /// Produces a non-streaming completion by aggregating `stream(...)` events.
+    ///
+    /// - Parameters:
+    ///   - messages: Conversation history to send to the model.
+    ///   - model: Requested model identifier from caller context.
+    ///   - options: Per-request options including tools and system prompt.
+    /// - Returns: Completed assistant message plus token usage when available.
     public nonisolated func complete(
         messages: [ChatMessage],
         model: String,
@@ -233,6 +269,11 @@ public actor MLXProvider: ChatProvider {
 
     // MARK: - Persona adapter management
 
+    /// Loads a LoRA adapter into the currently loaded base model.
+    ///
+    /// - Parameter path: Directory containing adapter weights and metadata.
+    ///
+    /// The base model must already be loaded with ``loadModel(progressHandler:)``.
     public func loadAdapter(at path: URL) async throws {
         guard let container else {
             throw ChatError.invalidConfiguration("Model must be loaded before loading an adapter.")
@@ -246,6 +287,7 @@ public actor MLXProvider: ChatProvider {
         print("[MLXProvider] Adapter loaded from \(path.lastPathComponent)")
     }
 
+    /// Unloads the currently active LoRA adapter, if any.
     public func unloadAdapter() async throws {
         guard let adapter = loadedAdapter, let container else { return }
         _ = await container.perform { ctx in

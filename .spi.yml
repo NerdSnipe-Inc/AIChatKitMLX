@@ -1,7 +1,11 @@
 version: 1
+metadata:
+  authors:
+    - name: NerdSnipe Inc.
+      link: https://github.com/NerdSnipe-Inc
 builder:
   configs:
     - platform: macos-spm
       target: AIChatMLX
-    - documentation_targets:
+      documentation_targets:
         - AIChatMLX

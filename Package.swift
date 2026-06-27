@@ -24,7 +24,7 @@ let package = Package(
         .package(url: "https://github.com/NerdSnipe-Inc/AIChatKit.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.0.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git",  .upToNextMajor(from: "0.9.0")),
-        .package(url: "https://github.com/huggingface/swift-transformers",     .upToNextMajor(from: "1.2.1")),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.2.1")),
     ],
     targets: [
         .target(

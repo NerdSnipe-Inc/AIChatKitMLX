@@ -5,9 +5,17 @@ import MLXLMCommon
 /// and native `call:name{...}` / `<|tool_call>` tool calls.
 public struct Gemma4StreamProcessor: Sendable {
 
+    /// Streaming events emitted by `Gemma4StreamProcessor`.
     public enum Event: Sendable, Equatable {
+        /// A model "thought" channel delta.
         case reasoning(String)
+        /// User-visible assistant text delta.
         case text(String)
+        /// A fully parsed inline or native tool call.
+        ///
+        /// - Parameters:
+        ///   - name: Tool function name.
+        ///   - argumentsJSON: Serialized JSON arguments object.
         case toolCall(name: String, argumentsJSON: String)
     }
 
@@ -27,15 +35,27 @@ public struct Gemma4StreamProcessor: Sendable {
     private var emittedToolCount = 0
     private var inlineCallBuffer = ""
 
+    /// Creates a processor for a specific streamed response.
+    ///
+    /// - Parameter tools: Native tool schema payload forwarded to `ToolCallProcessor`.
     public init(tools: [[String: any Sendable]]?) {
         self.toolProcessor = ToolCallProcessor(format: .gemma, tools: tools)
     }
 
+    /// Ingests the next streamed token chunk and emits any parsed events.
+    ///
+    /// - Parameter chunk: Raw text chunk from MLX generation output.
+    /// - Returns: Zero or more parsed events that became complete after appending `chunk`.
     public mutating func processChunk(_ chunk: String) -> [Event] {
         buffer += chunk
         return drain()
     }
 
+    /// Flushes any buffered partial state when the stream ends.
+    ///
+    /// Call this once after the model stream finishes to emit remaining text/tool calls.
+    ///
+    /// - Returns: Final events derived from buffered content and native tool processor state.
     public mutating func finish() -> [Event] {
         if !buffer.isEmpty {
             switch phase {
