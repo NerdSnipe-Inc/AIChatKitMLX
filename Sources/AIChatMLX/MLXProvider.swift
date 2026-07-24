@@ -112,7 +112,8 @@ public actor MLXProvider: ChatProvider {
     nonisolated private let configuration:      ModelConfiguration
     nonisolated private let generateParameters: GenerateParameters
     private var loadedAdapter:                  LoRAContainer?
-    nonisolated let adapterDirectoryURL: URL?
+    private var isLoadingAdapter = false
+    nonisolated let adapterDirectoryURL: URL? // internal: exposed for @testable access in tests
 
     // MARK: - Init
 
@@ -120,6 +121,7 @@ public actor MLXProvider: ChatProvider {
     ///
     /// - Parameters:
     ///   - modelId: Hub model id or repo slug resolvable by MLX.
+    ///   - adapterDirectoryURL: Optional directory URL for a LoRA adapter to auto-load on first inference. Pass `nil` (the default) to skip adapter loading.
     ///   - maxTokens: Optional generation token limit for completions.
     ///   - temperature: Sampling temperature for generation.
     ///   - topP: Nucleus sampling probability mass.
@@ -146,6 +148,7 @@ public actor MLXProvider: ChatProvider {
     ///
     /// - Parameters:
     ///   - modelPath: Local filesystem path to an MLX-compatible model directory.
+    ///   - adapterDirectoryURL: Optional directory URL for a LoRA adapter to auto-load on first inference. Pass `nil` (the default) to skip adapter loading.
     ///   - maxTokens: Optional generation token limit for completions.
     ///   - temperature: Sampling temperature for generation.
     ///   - topP: Nucleus sampling probability mass.
@@ -200,7 +203,9 @@ public actor MLXProvider: ChatProvider {
     /// comment.
     private func resolvedContainer() async throws -> ModelContainer {
         let container = try await MLXModelRuntime.shared.container(for: configuration, progressHandler: { _ in })
-        if let url = adapterDirectoryURL, loadedAdapter == nil {
+        if let url = adapterDirectoryURL, loadedAdapter == nil, !isLoadingAdapter {
+            isLoadingAdapter = true
+            defer { isLoadingAdapter = false }
             try await loadAdapter(at: url)
         }
         return container
