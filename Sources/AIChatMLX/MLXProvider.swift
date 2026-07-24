@@ -206,7 +206,11 @@ public actor MLXProvider: ChatProvider {
         if let url = adapterDirectoryURL, loadedAdapter == nil, !isLoadingAdapter {
             isLoadingAdapter = true
             defer { isLoadingAdapter = false }
-            try await loadAdapter(at: url)
+            do {
+                try await loadAdapter(at: url)
+            } catch {
+                print("[MLXProvider] Adapter load failed (using base model): \(error.localizedDescription)")
+            }
         }
         return container
     }
