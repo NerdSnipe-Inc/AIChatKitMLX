@@ -7,6 +7,63 @@ import MLXHuggingFace
 import HuggingFace
 import Tokenizers
 
+// MARK: - MLXModelRuntime
+
+/// Process-wide guarantee that at most one MLX model's weights are ever resident in unified/GPU
+/// memory at a time — regardless of how many `MLXProvider` instances exist or where they're
+/// constructed.
+///
+/// Model weights are multi-gigabyte `MLXArray` buffers; loading a second model while a first is
+/// still resident (e.g. one `MLXProvider` already loaded for on-device chat while a second,
+/// unrelated `MLXProvider` — such as a Model Manager download-validation instance — loads a
+/// different model id) can exhaust unified memory and lock up the system. Every `MLXProvider`
+/// routes its actual `loadModelContainer` call through this shared actor instead of loading
+/// independently, so a second model id always releases the first's `ModelContainer` before/while
+/// loading the new one, and a repeated request for the *same* model id that's already loaded
+/// reuses that exact `ModelContainer` rather than instantiating a duplicate.
+private actor MLXModelRuntime {
+    static let shared = MLXModelRuntime()
+
+    private var loadedModelName: String?
+    private var loadedContainer: ModelContainer?
+
+    /// Returns the `ModelContainer` for `configuration`, loading it if needed. If a *different*
+    /// model is currently resident, that container is dropped (allowing it to deallocate and
+    /// release its GPU/unified-memory buffers) before the requested one loads. This is the ONLY
+    /// place in the process that holds a `ModelContainer` reference across calls — every
+    /// `MLXProvider` resolves it fresh here rather than caching its own copy, so a second
+    /// provider instance can never keep a superseded model's weights alive.
+    func container(
+        for configuration: ModelConfiguration,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> ModelContainer {
+        let name = configuration.name
+        if let loadedContainer, loadedModelName == name {
+            return loadedContainer
+        }
+
+        loadedContainer = nil
+        loadedModelName = nil
+
+        let container = try await loadModelContainer(
+            from: #hubDownloader(),
+            using: #huggingFaceTokenizerLoader(),
+            configuration: configuration,
+            progressHandler: progressHandler
+        )
+        loadedContainer = container
+        loadedModelName = name
+        return container
+    }
+
+    /// Returns the already-loaded `ModelContainer` for `configuration` without triggering a load
+    /// — `nil` if `configuration`'s model isn't the currently-resident one.
+    func loadedContainer(for configuration: ModelConfiguration) -> ModelContainer? {
+        guard loadedModelName == configuration.name else { return nil }
+        return loadedContainer
+    }
+}
+
 // MARK: - MLXProvider
 
 /// ChatProvider that runs inference on-device via Apple MLX.
@@ -54,8 +111,8 @@ public actor MLXProvider: ChatProvider {
 
     nonisolated private let configuration:      ModelConfiguration
     nonisolated private let generateParameters: GenerateParameters
-    private var container:                      ModelContainer?
     private var loadedAdapter:                  LoRAContainer?
+    nonisolated let adapterDirectoryURL: URL?
 
     // MARK: - Init
 
@@ -69,12 +126,14 @@ public actor MLXProvider: ChatProvider {
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     public init(
         modelId: String = MLXProvider.defaultModelId,
+        adapterDirectoryURL: URL? = nil,
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil
     ) {
         self.configuration = ModelConfiguration(id: modelId)
+        self.adapterDirectoryURL = adapterDirectoryURL
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -93,12 +152,14 @@ public actor MLXProvider: ChatProvider {
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     public init(
         modelPath: URL,
+        adapterDirectoryURL: URL? = nil,
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil
     ) {
         self.configuration = ModelConfiguration(directory: modelPath)
+        self.adapterDirectoryURL = adapterDirectoryURL
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -115,17 +176,34 @@ public actor MLXProvider: ChatProvider {
     public func loadModel(
         progressHandler: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
-        guard container == nil else { return }
         let handler = progressHandler ?? { _ in }
-        // loadModelContainer is the MLXLMCommon free function — it tries MLXVLM's factory
-        // first, then MLXLLM, automatically routing to the right architecture.
-        // Importing MLXVLM above is required to register its TrampolineModelFactory.
-        container = try await loadModelContainer(
-            from: #hubDownloader(),
-            using: #huggingFaceTokenizerLoader(),
-            configuration: configuration,
+        // Routed through `MLXModelRuntime.shared` rather than calling `loadModelContainer`
+        // directly, and the result is intentionally NOT cached in a field on this instance —
+        // see `MLXModelRuntime`'s doc comment for why: it's what guarantees only one model's
+        // weights are ever resident in memory, no matter how many `MLXProvider` instances
+        // request a load (e.g. the app's shared chat provider and a Model Manager
+        // download-validation provider both loading around the same time). If this instance
+        // cached its own `ModelContainer` reference, it would keep a superseded model's
+        // multi-gigabyte weights alive even after `MLXModelRuntime` moved on to a different one.
+        //
+        // loadModelContainer (inside MLXModelRuntime) tries MLXVLM's factory first, then
+        // MLXLLM, automatically routing to the right architecture. Importing MLXVLM above is
+        // required to register its TrampolineModelFactory.
+        _ = try await MLXModelRuntime.shared.container(
+            for: configuration,
             progressHandler: handler
         )
+    }
+
+    /// Resolves this provider's `ModelContainer` via `MLXModelRuntime.shared`, loading it first
+    /// if needed. Always fetched fresh (never cached on this instance) — see `loadModel`'s doc
+    /// comment.
+    private func resolvedContainer() async throws -> ModelContainer {
+        let container = try await MLXModelRuntime.shared.container(for: configuration, progressHandler: { _ in })
+        if let url = adapterDirectoryURL, loadedAdapter == nil {
+            try await loadAdapter(at: url)
+        }
+        return container
     }
 
     // MARK: - ChatProvider
@@ -145,11 +223,7 @@ public actor MLXProvider: ChatProvider {
         AsyncThrowingStream { continuation in
             Task {
                 do {
-                    try await self.ensureLoaded()
-
-                    guard let container = await self.container else {
-                        throw ChatError.invalidConfiguration("MLX model container failed to initialise.")
-                    }
+                    let container = try await self.resolvedContainer()
 
                     let params      = self.generateParameters
                     let toolSpecs   = Self.toToolSpecs(options.tools) ?? options.nativeToolSpecs
@@ -275,7 +349,7 @@ public actor MLXProvider: ChatProvider {
     ///
     /// The base model must already be loaded with ``loadModel(progressHandler:)``.
     public func loadAdapter(at path: URL) async throws {
-        guard let container else {
+        guard let container = await MLXModelRuntime.shared.loadedContainer(for: configuration) else {
             throw ChatError.invalidConfiguration("Model must be loaded before loading an adapter.")
         }
         if loadedAdapter != nil { try await unloadAdapter() }
@@ -289,7 +363,9 @@ public actor MLXProvider: ChatProvider {
 
     /// Unloads the currently active LoRA adapter, if any.
     public func unloadAdapter() async throws {
-        guard let adapter = loadedAdapter, let container else { return }
+        guard let adapter = loadedAdapter,
+              let container = await MLXModelRuntime.shared.loadedContainer(for: configuration)
+        else { return }
         _ = await container.perform { ctx in
             adapter.unload(from: ctx.model)
         }
@@ -298,11 +374,6 @@ public actor MLXProvider: ChatProvider {
     }
 
     // MARK: - Private helpers
-
-    private func ensureLoaded() async throws {
-        guard container == nil else { return }
-        try await loadModel()
-    }
 
     /// Serialise `[String: JSONValue]` tool call arguments back to a JSON string.
     private static func serializeArguments(_ args: [String: JSONValue]) -> String {
