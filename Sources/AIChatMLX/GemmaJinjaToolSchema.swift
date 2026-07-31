@@ -52,7 +52,7 @@ enum GemmaJinjaToolSchema {
             prop["type"] = first
         }
 
-        if var items = prop["items"] as? [String: Any] {
+        if let items = prop["items"] as? [String: Any] {
             prop["items"] = sanitizeProperty(items)
         }
 

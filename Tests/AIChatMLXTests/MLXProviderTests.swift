@@ -4,9 +4,8 @@ import AIChatCore
 
 // Tests for MLXProvider.toMLXMessages — the history-to-prompt conversion that feeds Gemma 4.
 //
-// Gemma 4's Jinja template enforces two hard rules that every test validates:
-//   1. Strict user/assistant alternation (no consecutive same-role turns)
-//   2. No role:"tool" messages (Gemma only knows user/model/system)
+// Gemma 4's Jinja template supports native assistant tool_calls followed by
+// role:"tool" messages carrying the matching tool_call_id.
 //
 // These tests run without a model or simulator and must stay green on every PR.
 
@@ -22,22 +21,26 @@ final class MLXProviderHistoryTests: XCTestCase {
         msg["role"] as? String ?? "<missing>"
     }
 
-    /// Assert the role sequence alternates strictly user/assistant (ignoring system at index 0).
+    /// Assert ordinary conversation turns alternate. Native tool results do not
+    /// count as turns because Gemma renders them inside the preceding model turn.
     private func assertAlternates(_ result: [[String: any Sendable]], file: StaticString = #file, line: UInt = #line) {
-        let turns = result.filter { ($0["role"] as? String) != "system" }
-        for i in turns.indices {
-            let expected = i % 2 == 0 ? "user" : "assistant"
-            XCTAssertEqual(role(turns[i]), expected,
-                "Position \(i) should be \(expected) but got \(role(turns[i]))",
-                file: file, line: line)
+        let turns = result.filter {
+            let currentRole = role($0)
+            return currentRole != "system" && currentRole != "tool"
+        }
+        XCTAssertEqual(role(turns.first ?? [:]), "user", file: file, line: line)
+        for index in turns.indices.dropFirst() {
+            if role(turns[index]) == "user" {
+                XCTAssertEqual(role(turns[index - 1]), "assistant", file: file, line: line)
+            }
         }
     }
 
-    /// Assert no message has role:"tool".
-    private func assertNoToolRole(_ result: [[String: any Sendable]], file: StaticString = #file, line: UInt = #line) {
-        for msg in result {
-            XCTAssertNotEqual(role(msg), "tool",
-                "role:\"tool\" must never reach Gemma's template", file: file, line: line)
+    private func assertNativeToolResults(_ result: [[String: any Sendable]], file: StaticString = #file, line: UInt = #line) {
+        for index in result.indices where role(result[index]) == "tool" {
+            XCTAssertGreaterThan(index, 0, file: file, line: line)
+            XCTAssertEqual(role(result[index - 1]), "assistant", file: file, line: line)
+            XCTAssertNotNil(result[index]["tool_call_id"] as? String, file: file, line: line)
         }
     }
 
@@ -95,11 +98,11 @@ final class MLXProviderHistoryTests: XCTestCase {
         ]
         let result = msgs(history)
         assertAlternates(result)
-        assertNoToolRole(result)
-        // user → assistant(tool_calls) → user(result)
+        assertNativeToolResults(result)
+        // user → assistant(tool_calls) → tool(result)
         XCTAssertEqual(result.count, 3)
-        XCTAssertEqual(role(result[2]), "user",
-            "Tool result must be converted to user turn for Gemma")
+        XCTAssertEqual(role(result[2]), "tool")
+        XCTAssertEqual(result[2]["tool_call_id"] as? String, toolCallId)
     }
 
     func test_toolCallOnly_toolResultContentPreserved() {
@@ -135,7 +138,7 @@ final class MLXProviderHistoryTests: XCTestCase {
         ]
         let result = msgs(history)
         assertAlternates(result)
-        assertNoToolRole(result)
+        assertNativeToolResults(result)
     }
 
     func test_textPreamblePlusToolCall_dropsTextOnlyAssistant() {
@@ -148,7 +151,7 @@ final class MLXProviderHistoryTests: XCTestCase {
             ChatMessage(toolCallId: "id1", content: "Results here"),
         ]
         let result = msgs(history)
-        // Should be: user, assistant(tool_calls), user(result) — 3 messages
+        // Should be: user, assistant(tool_calls), tool(result) — 3 messages
         XCTAssertEqual(result.count, 3,
             "Text-only assistant following tool_calls assistant must be dropped; got \(result.count)")
     }
@@ -171,8 +174,8 @@ final class MLXProviderHistoryTests: XCTestCase {
         ]
         let result = msgs(history)
         assertAlternates(result)
-        assertNoToolRole(result)
-        // user → assistant(tool_calls) → user(result) → assistant(answer)
+        assertNativeToolResults(result)
+        // user → assistant(tool_calls) → tool(result) → assistant(answer)
         XCTAssertEqual(result.count, 4)
         XCTAssertEqual(role(result[3]), "assistant")
     }
@@ -192,7 +195,7 @@ final class MLXProviderHistoryTests: XCTestCase {
         ]
         let result = msgs(history)
         assertAlternates(result)
-        assertNoToolRole(result)
+        assertNativeToolResults(result)
     }
 
     // MARK: - Multi-turn with multiple tool calls
@@ -213,7 +216,7 @@ final class MLXProviderHistoryTests: XCTestCase {
         ]
         let result = msgs(history)
         assertAlternates(result)
-        assertNoToolRole(result)
+        assertNativeToolResults(result)
     }
 
     // MARK: - System prompt does not affect alternation count
@@ -242,13 +245,14 @@ final class MLXProviderHistoryTests: XCTestCase {
         XCTAssertEqual(result.count, 1)
     }
 
-    func test_toolResultWithoutPrecedingToolCall_stillConvertsToUser() {
-        // Defensive: even a stray tool message must not send role:"tool" to Gemma.
+    func test_toolResultWithoutPrecedingToolCall_isDropped() {
+        // A malformed orphan cannot be associated with a preceding native tool call.
         let history: [ChatMessage] = [
             ChatMessage(role: .user, content: "Hi"),
             ChatMessage(toolCallId: "orphan", content: "Some result"),
         ]
         let result = msgs(history)
-        assertNoToolRole(result)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(role(result[0]), "user")
     }
 }

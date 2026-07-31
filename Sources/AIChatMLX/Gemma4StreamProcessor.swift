@@ -3,7 +3,7 @@ import MLXLMCommon
 
 /// Splits Gemma 4 streamed output into reasoning (thought channel), user-visible text,
 /// and native `call:name{...}` / `<|tool_call>` tool calls.
-public struct Gemma4StreamProcessor: Sendable {
+public struct Gemma4StreamProcessor {
 
     /// Streaming events emitted by `Gemma4StreamProcessor`.
     public enum Event: Sendable, Equatable {
@@ -318,12 +318,20 @@ enum GemmaInlineCallParser {
         var strings: [String] = []
         var working = body
 
-        while let start = working.range(of: #"<|"|>"#) {
-            guard let end = working.range(of: #"<|"|>"#, range: start.upperBound..<working.endIndex) else { break }
-            let value = String(working[start.upperBound..<end.lowerBound])
-            strings.append(value)
-            let placeholder = "\u{0000}\(strings.count - 1)\u{0000}"
-            working.replaceSubrange(start.lowerBound..<end.upperBound, with: placeholder)
+        for delimiter in [#"<|"|>"#, "<escape>"] {
+            while let start = working.range(of: delimiter) {
+                guard let end = working.range(
+                    of: delimiter,
+                    range: start.upperBound..<working.endIndex
+                ) else { break }
+                let value = String(working[start.upperBound..<end.lowerBound])
+                strings.append(value)
+                let placeholder = "\u{0000}\(strings.count - 1)\u{0000}"
+                working.replaceSubrange(
+                    start.lowerBound..<end.upperBound,
+                    with: placeholder
+                )
+            }
         }
 
         var json = working.replacingOccurrences(

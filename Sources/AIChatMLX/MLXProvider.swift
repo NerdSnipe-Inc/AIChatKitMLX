@@ -9,41 +9,49 @@ import Tokenizers
 
 // MARK: - MLXModelRuntime
 
-/// Process-wide guarantee that at most one MLX model's weights are ever resident in unified/GPU
-/// memory at a time — regardless of how many `MLXProvider` instances exist or where they're
-/// constructed.
+/// Selects which process-wide residency slot a model occupies.
 ///
-/// Model weights are multi-gigabyte `MLXArray` buffers; loading a second model while a first is
-/// still resident (e.g. one `MLXProvider` already loaded for on-device chat while a second,
-/// unrelated `MLXProvider` — such as a Model Manager download-validation instance — loads a
-/// different model id) can exhaust unified memory and lock up the system. Every `MLXProvider`
-/// routes its actual `loadModelContainer` call through this shared actor instead of loading
-/// independently, so a second model id always releases the first's `ModelContainer` before/while
-/// loading the new one, and a repeated request for the *same* model id that's already loaded
-/// reuses that exact `ModelContainer` rather than instantiating a duplicate.
+/// The primary slot is used by the conversational Gemma model. The auxiliary slot is reserved
+/// for a small routing model such as FunctionGemma so tool selection does not evict and reload
+/// the multi-gigabyte conversational model on every request.
+public enum MLXModelResidency: Sendable, Hashable {
+    case primary
+    case auxiliary
+}
+
+/// Process-wide model residency manager. One conversational model and one small auxiliary routing
+/// model may be resident at once; loading a replacement into either slot releases only the model
+/// previously occupying that slot.
+///
+/// Conversational model weights are multi-gigabyte `MLXArray` buffers. Every `MLXProvider` routes
+/// loading through this actor so only one model occupies each residency slot and repeated requests
+/// reuse that slot's container. The auxiliary slot is intentionally limited to the small router.
 private actor MLXModelRuntime {
     static let shared = MLXModelRuntime()
 
-    private var loadedModelName: String?
-    private var loadedContainer: ModelContainer?
+    private var loadedModelNames: [MLXModelResidency: String] = [:]
+    private var loadedContainers: [MLXModelResidency: ModelContainer] = [:]
+    private var loadedRevisions: [MLXModelResidency: UInt64] = [:]
 
     /// Returns the `ModelContainer` for `configuration`, loading it if needed. If a *different*
     /// model is currently resident, that container is dropped (allowing it to deallocate and
     /// release its GPU/unified-memory buffers) before the requested one loads. This is the ONLY
     /// place in the process that holds a `ModelContainer` reference across calls — every
     /// `MLXProvider` resolves it fresh here rather than caching its own copy, so a second
-    /// provider instance can never keep a superseded model's weights alive.
+    /// provider instance can never keep a superseded model's weights alive within that slot.
     func container(
         for configuration: ModelConfiguration,
+        residency: MLXModelResidency,
         progressHandler: @Sendable @escaping (Progress) -> Void
     ) async throws -> ModelContainer {
         let name = configuration.name
-        if let loadedContainer, loadedModelName == name {
+        if let loadedContainer = loadedContainers[residency],
+           loadedModelNames[residency] == name {
             return loadedContainer
         }
 
-        loadedContainer = nil
-        loadedModelName = nil
+        loadedContainers[residency] = nil
+        loadedModelNames[residency] = nil
 
         let container = try await loadModelContainer(
             from: #hubDownloader(),
@@ -51,16 +59,30 @@ private actor MLXModelRuntime {
             configuration: configuration,
             progressHandler: progressHandler
         )
-        loadedContainer = container
-        loadedModelName = name
+        loadedContainers[residency] = container
+        loadedModelNames[residency] = name
+        loadedRevisions[residency, default: 0] &+= 1
         return container
     }
 
     /// Returns the already-loaded `ModelContainer` for `configuration` without triggering a load
     /// — `nil` if `configuration`'s model isn't the currently-resident one.
-    func loadedContainer(for configuration: ModelConfiguration) -> ModelContainer? {
-        guard loadedModelName == configuration.name else { return nil }
-        return loadedContainer
+    func loadedContainer(
+        for configuration: ModelConfiguration,
+        residency: MLXModelResidency
+    ) -> ModelContainer? {
+        guard loadedModelNames[residency] == configuration.name else { return nil }
+        return loadedContainers[residency]
+    }
+
+    func revision(
+        for configuration: ModelConfiguration,
+        residency: MLXModelResidency
+    ) -> UInt64? {
+        guard loadedModelNames[residency] == configuration.name,
+              loadedContainers[residency] != nil
+        else { return nil }
+        return loadedRevisions[residency]
     }
 }
 
@@ -79,14 +101,18 @@ private actor MLXModelRuntime {
 /// Pass tools via `ChatRequestOptions.nativeToolSpecs`.
 public actor MLXProvider: ChatProvider {
 
+    public enum AdapterLoadingPolicy: Sendable, Equatable {
+        case optional
+        case required
+    }
+
     // MARK: - Model selection
 
     /// Small text-only model — fits on any Apple Silicon device (≥ 8 GB RAM).
     public static let smallModelId = "mlx-community/gemma-4-e4b-it-4bit"
 
-    /// Large text model — Qwen 2.5 7B Instruct (4-bit), strong reasoning and instruction following.
-    /// Requires ≥ 16 GB RAM (downloads ~4.5 GB).
-    public static let largeModelId = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    /// Large Gemma 4 model. The host app should enforce its unified-memory requirement.
+    public static let largeModelId = "mlx-community/gemma-4-31b-it-4bit"
 
     /// Always returns the small model — the large model is opt-in via Model Manager only.
     public static func recommendedModelId() -> String {
@@ -111,9 +137,18 @@ public actor MLXProvider: ChatProvider {
 
     nonisolated private let configuration:      ModelConfiguration
     nonisolated private let generateParameters: GenerateParameters
+    nonisolated private let residency: MLXModelResidency
+    nonisolated private let streamSyntax: StreamSyntax
     private var loadedAdapter:                  LoRAContainer?
+    private var loadedAdapterRevision:          UInt64?
     private var isLoadingAdapter = false
     nonisolated let adapterDirectoryURL: URL? // internal: exposed for @testable access in tests
+    nonisolated private let adapterLoadingPolicy: AdapterLoadingPolicy
+
+    enum StreamSyntax: Sendable {
+        case gemma4
+        case functionGemma
+    }
 
     // MARK: - Init
 
@@ -129,6 +164,8 @@ public actor MLXProvider: ChatProvider {
     public init(
         modelId: String = MLXProvider.defaultModelId,
         adapterDirectoryURL: URL? = nil,
+        adapterLoadingPolicy: AdapterLoadingPolicy = .optional,
+        residency: MLXModelResidency = .primary,
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
@@ -136,6 +173,11 @@ public actor MLXProvider: ChatProvider {
     ) {
         self.configuration = ModelConfiguration(id: modelId)
         self.adapterDirectoryURL = adapterDirectoryURL
+        self.adapterLoadingPolicy = adapterLoadingPolicy
+        self.residency = residency
+        self.streamSyntax = modelId.lowercased().contains("functiongemma")
+            ? .functionGemma
+            : .gemma4
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -156,6 +198,8 @@ public actor MLXProvider: ChatProvider {
     public init(
         modelPath: URL,
         adapterDirectoryURL: URL? = nil,
+        adapterLoadingPolicy: AdapterLoadingPolicy = .optional,
+        residency: MLXModelResidency = .primary,
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
@@ -163,6 +207,11 @@ public actor MLXProvider: ChatProvider {
     ) {
         self.configuration = ModelConfiguration(directory: modelPath)
         self.adapterDirectoryURL = adapterDirectoryURL
+        self.adapterLoadingPolicy = adapterLoadingPolicy
+        self.residency = residency
+        self.streamSyntax = modelPath.path.lowercased().contains("functiongemma")
+            ? .functionGemma
+            : .gemma4
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -182,10 +231,8 @@ public actor MLXProvider: ChatProvider {
         let handler = progressHandler ?? { _ in }
         // Routed through `MLXModelRuntime.shared` rather than calling `loadModelContainer`
         // directly, and the result is intentionally NOT cached in a field on this instance —
-        // see `MLXModelRuntime`'s doc comment for why: it's what guarantees only one model's
-        // weights are ever resident in memory, no matter how many `MLXProvider` instances
-        // request a load (e.g. the app's shared chat provider and a Model Manager
-        // download-validation provider both loading around the same time). If this instance
+        // see `MLXModelRuntime`'s doc comment for why: it guarantees one model per residency slot,
+        // no matter how many `MLXProvider` instances request a load. If this instance
         // cached its own `ModelContainer` reference, it would keep a superseded model's
         // multi-gigabyte weights alive even after `MLXModelRuntime` moved on to a different one.
         //
@@ -194,6 +241,7 @@ public actor MLXProvider: ChatProvider {
         // required to register its TrampolineModelFactory.
         _ = try await MLXModelRuntime.shared.container(
             for: configuration,
+            residency: residency,
             progressHandler: handler
         )
     }
@@ -202,13 +250,36 @@ public actor MLXProvider: ChatProvider {
     /// if needed. Always fetched fresh (never cached on this instance) — see `loadModel`'s doc
     /// comment.
     private func resolvedContainer() async throws -> ModelContainer {
-        let container = try await MLXModelRuntime.shared.container(for: configuration, progressHandler: { _ in })
-        if let url = adapterDirectoryURL, loadedAdapter == nil, !isLoadingAdapter {
+        let container = try await MLXModelRuntime.shared.container(
+            for: configuration,
+            residency: residency,
+            progressHandler: { _ in }
+        )
+        let revision = await MLXModelRuntime.shared.revision(
+            for: configuration,
+            residency: residency
+        )
+        if loadedAdapterRevision != revision {
+            loadedAdapter = nil
+            loadedAdapterRevision = nil
+        }
+
+        guard let url = adapterDirectoryURL else {
+            if adapterLoadingPolicy == .required {
+                throw ChatError.invalidConfiguration(
+                    "A compatible LoRA adapter is required for this model but is not installed."
+                )
+            }
+            return container
+        }
+
+        if loadedAdapter == nil, !isLoadingAdapter {
             isLoadingAdapter = true
             defer { isLoadingAdapter = false }
             do {
                 try await loadAdapter(at: url)
             } catch {
+                if adapterLoadingPolicy == .required { throw error }
                 print("[MLXProvider] Adapter load failed (using base model): \(error.localizedDescription)")
             }
         }
@@ -248,7 +319,10 @@ public actor MLXProvider: ChatProvider {
                             context: ctx
                         )
 
-                        var processor = Gemma4StreamProcessor(tools: toolSpecs)
+                        var processor = ModelStreamProcessor(
+                            syntax: self.streamSyntax,
+                            tools: toolSpecs
+                        )
                         var info: GenerateCompletionInfo?
 
                         for await generation in stream {
@@ -358,7 +432,10 @@ public actor MLXProvider: ChatProvider {
     ///
     /// The base model must already be loaded with ``loadModel(progressHandler:)``.
     public func loadAdapter(at path: URL) async throws {
-        guard let container = await MLXModelRuntime.shared.loadedContainer(for: configuration) else {
+        guard let container = await MLXModelRuntime.shared.loadedContainer(
+            for: configuration,
+            residency: residency
+        ) else {
             throw ChatError.invalidConfiguration("Model must be loaded before loading an adapter.")
         }
         if loadedAdapter != nil { try await unloadAdapter() }
@@ -367,18 +444,26 @@ public actor MLXProvider: ChatProvider {
             try adapter.load(into: ctx.model)
         }
         loadedAdapter = adapter
+        loadedAdapterRevision = await MLXModelRuntime.shared.revision(
+            for: configuration,
+            residency: residency
+        )
         print("[MLXProvider] Adapter loaded from \(path.lastPathComponent)")
     }
 
     /// Unloads the currently active LoRA adapter, if any.
     public func unloadAdapter() async throws {
         guard let adapter = loadedAdapter,
-              let container = await MLXModelRuntime.shared.loadedContainer(for: configuration)
+              let container = await MLXModelRuntime.shared.loadedContainer(
+                for: configuration,
+                residency: residency
+              )
         else { return }
         _ = await container.perform { ctx in
             adapter.unload(from: ctx.model)
         }
         loadedAdapter = nil
+        loadedAdapterRevision = nil
         print("[MLXProvider] Adapter unloaded")
     }
 
@@ -404,6 +489,7 @@ public actor MLXProvider: ChatProvider {
         systemPrompt: String?
     ) -> [[String: any Sendable]] {
         var result: [[String: any Sendable]] = []
+        var pendingToolCallIDs = Set<String>()
 
         if let sys = systemPrompt {
             result.append(["role": "system" as any Sendable, "content": sys as any Sendable])
@@ -412,17 +498,25 @@ public actor MLXProvider: ChatProvider {
         for message in messages {
 
             // --- Tool-result messages ---
-            // Gemma 4's Jinja template enforces strict user/assistant alternation and
-            // throws a TemplateException on role:"tool". Inject tool results as user
-            // turns so the alternation is preserved: user → assistant(tool_calls) → user(result) → assistant.
+            // Gemma 4's template forward-scans native role:"tool" messages immediately
+            // following an assistant tool call and resolves them through tool_call_id.
+            // Rewriting this as a user turn makes the result look like a new request,
+            // which can trigger repeated or fabricated follow-up calls.
             if message.role == .tool {
                 let text = message.content.compactMap {
                     if case .text(let t) = $0 { return t } else { return nil }
                 }.joined(separator: "\n")
 
+                guard let toolCallId = message.toolCallId,
+                      !toolCallId.isEmpty,
+                      !text.isEmpty,
+                      pendingToolCallIDs.remove(toolCallId) != nil
+                else { continue }
+
                 result.append([
-                    "role":    "user" as any Sendable,
-                    "content": text   as any Sendable
+                    "role":         "tool"      as any Sendable,
+                    "tool_call_id": toolCallId  as any Sendable,
+                    "content":      text        as any Sendable
                 ])
                 continue
             }
@@ -443,6 +537,7 @@ public actor MLXProvider: ChatProvider {
                     ]
                 }
                 guard !nativeCalls.isEmpty else { continue }
+                pendingToolCallIDs = Set(toolCalls.map(\.id))
                 result.append([
                     "role":       "assistant" as any Sendable,
                     "content":    ""          as any Sendable,
@@ -466,6 +561,7 @@ public actor MLXProvider: ChatProvider {
                 continue
             }
 
+            pendingToolCallIDs.removeAll()
             result.append([
                 "role":    message.role.rawValue as any Sendable,
                 "content": parts.joined(separator: "\n") as any Sendable
