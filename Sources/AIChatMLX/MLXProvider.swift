@@ -29,6 +29,19 @@ public enum MLXModelResidency: Sendable, Hashable {
 protocol WiredMemoryCoordinating: Sendable {
     func start(_ ticket: WiredMemoryTicket) async
     func end(_ ticket: WiredMemoryTicket) async
+
+    /// Whether a new `.reservation` ticket of `size` bytes would currently be admitted by the
+    /// shared residency policy, given `existingSizes` (the weight sizes already resident in the
+    /// other residency slots).
+    ///
+    /// Deliberately synchronous so ``MLXModelRuntime/reserve(weightBytes:for:)`` gains no extra
+    /// actor suspension point between measuring the other slots and installing its ticket.
+    func canAdmitReservation(size: Int, alongside existingSizes: [Int]) -> Bool
+}
+
+extension WiredMemoryCoordinating {
+    /// Default: admit everything. Test fakes that don't care about admission inherit this.
+    func canAdmitReservation(size: Int, alongside existingSizes: [Int]) -> Bool { true }
 }
 
 /// Production coordinator — drives the real `WiredMemoryManager` through the ticket API.
@@ -41,6 +54,26 @@ struct LiveWiredMemoryCoordinator: WiredMemoryCoordinating {
 
     func start(_ ticket: WiredMemoryTicket) async { _ = await ticket.start() }
     func end(_ ticket: WiredMemoryTicket) async { _ = await ticket.end() }
+
+    /// Asks the shared residency policy the same admission question `WiredMemoryManager.start`
+    /// will ask, *before* a ticket is created — so a reservation that would be denied is never
+    /// started in the first place.
+    ///
+    /// `baseline: 0` matches what `WiredMemoryManager.resolveBaseline()` reports on a GPU-backed
+    /// Apple Silicon device while only reservations (no active generation) are outstanding: it
+    /// returns the manager's cached `currentLimit`, and `applyCurrentLimit()` drives that back to
+    /// the captured baseline whenever no `.active` ticket is running. Including one
+    /// ``MLXModelRuntime/generationWorkspaceBytes`` allowance in `activeSizes` makes this check
+    /// *stricter* than the manager's own (which only counts a generation ticket while one is
+    /// actually in flight), which is the safe direction — it reserves headroom for the generation
+    /// that will inevitably follow the load.
+    func canAdmitReservation(size: Int, alongside existingSizes: [Int]) -> Bool {
+        MLXModelRuntime.residencyPolicy.canAdmit(
+            baseline: 0,
+            activeSizes: existingSizes + [MLXModelRuntime.generationWorkspaceBytes],
+            newSize: size
+        )
+    }
 }
 
 /// Process-wide model residency manager. One conversational model and one small auxiliary routing
@@ -105,6 +138,14 @@ actor MLXModelRuntime {
     private var loadedContainers: [MLXModelResidency: ModelContainer] = [:]
     private var loadedRevisions: [MLXModelResidency: UInt64] = [:]
 
+    /// Measured weight bytes of each slot's resident model.
+    ///
+    /// Tracked separately from ``reservationTickets`` because a reservation can be *skipped* when
+    /// admission would be denied (see ``reserve(weightBytes:for:)``) — the weights are resident
+    /// either way, so this is the authoritative "how big is what's in this slot" figure for both
+    /// the admission pre-check and ``residentWeightBytes(in:)``.
+    private var loadedWeightBytes: [MLXModelResidency: Int] = [:]
+
     /// The live `.reservation` ticket for each slot's loaded weights. Keyed by slot so a slot's
     /// reservation can be ended precisely when that slot is evicted or replaced, without touching
     /// the other slot's reservation.
@@ -144,6 +185,7 @@ actor MLXModelRuntime {
         await releaseReservation(for: residency)
         loadedContainers[residency] = nil
         loadedModelNames[residency] = nil
+        loadedWeightBytes[residency] = nil
 
         let container = try await loadModelContainer(
             from: #hubDownloader(),
@@ -159,6 +201,7 @@ actor MLXModelRuntime {
         let weightBytes = await container.perform { ctx in
             ctx.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
         }
+        loadedWeightBytes[residency] = weightBytes > 0 ? weightBytes : nil
         await reserve(weightBytes: weightBytes, for: residency)
 
         return container
@@ -172,9 +215,46 @@ actor MLXModelRuntime {
     /// Reservation tickets participate in admission and limit computation but do not keep the wired
     /// limit elevated on their own — they make the slot's weights visible in the shared budget
     /// without wiring memory while the model sits idle.
+    ///
+    /// ## Why admission is pre-checked rather than simply awaited
+    ///
+    /// `WiredMemoryTicket.start()` does **not** fail on denial — it suspends in
+    /// `WiredMemoryManager`'s unbounded `while !policy.canAdmit(...)` waiter loop until capacity
+    /// appears or the task is cancelled. Denial is genuinely reachable here: with both residency
+    /// slots holding large models (e.g. a conversational model in `.primary` while a download
+    /// populates `.auxiliary`), `WiredSumPolicy`'s uncapped clamp to
+    /// `GPU.maxRecommendedWorkingSetBytes()` denies the second reservation on a minimum-spec
+    /// device. Awaiting that here would hang `container(for:residency:)` indefinitely — and since
+    /// every AI feature in the host app funnels through one FIFO generation serializer, one stuck
+    /// load blocks all of them. Worse, a concurrent eviction that clears
+    /// ``reservationTickets`` while `start()` is still parked would leave a ticket that later gets
+    /// admitted into the shared `WiredMemoryManager` with no local record — permanently inflating
+    /// the process-wide wired limit and tripping the manager's DEBUG `"Ticket not active"`
+    /// assertion on any later `end()`.
+    ///
+    /// So: ask the policy first, and if it would deny, **skip the reservation entirely** for this
+    /// load. A skipped reservation undercounts the shared budget, which is the safe direction —
+    /// the weights are resident in memory either way, so not counting them only makes the wired
+    /// *limit* computation conservative; it cannot hang a load or leak a ticket. `loadedWeightBytes`
+    /// still records the slot's real size, so the next slot's pre-check accounts for it.
     func reserve(weightBytes: Int, for residency: MLXModelResidency) async {
         await releaseReservation(for: residency)
         guard weightBytes > 0 else { return }
+
+        // Sizes already resident in the *other* slots (this slot's reservation was just released).
+        // Uses `loadedWeightBytes` rather than the live ticket sizes so a previously-skipped
+        // reservation still counts against the budget in this check.
+        let otherSlotSizes = loadedWeightBytes
+            .filter { $0.key != residency }
+            .map(\.value)
+        guard coordinator.canAdmitReservation(size: weightBytes, alongside: otherSlotSizes) else {
+            print(
+                "[MLXModelRuntime] Skipping wired-memory reservation for \(residency) " +
+                "(\(weightBytes) bytes alongside \(otherSlotSizes)) — admission would be denied. " +
+                "Weights remain resident; only the shared wired-limit accounting is conservative."
+            )
+            return
+        }
 
         let ticket = WiredMemoryTicket(
             size: weightBytes,
@@ -222,6 +302,13 @@ actor MLXModelRuntime {
             loadedModelNames[residency] = name
         }
 
+        /// Test seam: directly records `weightBytes` as `residency`'s resident footprint, as a
+        /// real load would. Lets admission-gate tests simulate an already-occupied slot without a
+        /// Metal device.
+        func test_markWeightBytes(_ weightBytes: Int, for residency: MLXModelResidency) {
+            loadedWeightBytes[residency] = weightBytes > 0 ? weightBytes : nil
+        }
+
         /// Test seam: whether `residency` currently has `name` recorded as its resident model —
         /// i.e. whether `container(for:residency:)`'s reuse check would treat it as already loaded.
         func isModelNameLoaded(_ name: String, for residency: MLXModelResidency) -> Bool {
@@ -240,6 +327,17 @@ actor MLXModelRuntime {
         await releaseReservation(for: residency)
         loadedContainers[residency] = nil
         loadedModelNames[residency] = nil
+        loadedWeightBytes[residency] = nil
+    }
+
+    /// Measured weight bytes of the model currently resident in `residency` — `nil` when the slot
+    /// holds nothing.
+    ///
+    /// Reported independently of whether the slot managed to take a wired-memory reservation, so
+    /// callers can gate "would loading another large model alongside this one be safe?" decisions
+    /// on the real footprint.
+    func residentWeightBytes(in residency: MLXModelResidency) -> Int? {
+        loadedWeightBytes[residency]
     }
 
     /// Returns the already-loaded `ModelContainer` for `configuration` without triggering a load
@@ -411,6 +509,23 @@ public actor MLXProvider: ChatProvider {
     /// Safe to call when nothing is resident in `residency`: it is then a no-op.
     public static func releaseResidency(_ residency: MLXModelResidency) async {
         await MLXModelRuntime.shared.releaseSlot(residency)
+    }
+
+    /// The residency slot this provider's model occupies.
+    ///
+    /// Exposed so call sites that tear a provider's slot down (`releaseResidency(_:)`) can read the
+    /// provider's *actual* slot instead of hardcoding `.primary` — the app constructs `.auxiliary`
+    /// providers too.
+    public nonisolated var modelResidency: MLXModelResidency { residency }
+
+    /// Measured weight bytes of whatever model is currently resident in `residency` — `nil` when
+    /// the slot is empty.
+    ///
+    /// Lets a host app gate "is it safe to load a second large model into the other slot right
+    /// now?" on the real resident footprint rather than guessing. Reported whether or not the slot
+    /// holds a wired-memory reservation.
+    public static func residentWeightBytes(in residency: MLXModelResidency) async -> Int? {
+        await MLXModelRuntime.shared.residentWeightBytes(in: residency)
     }
 
     // MARK: - Model management

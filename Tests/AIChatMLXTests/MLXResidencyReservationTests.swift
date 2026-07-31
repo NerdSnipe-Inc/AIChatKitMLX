@@ -53,6 +53,154 @@ private actor RecordingCoordinator: WiredMemoryCoordinating {
     }
 }
 
+/// Coordinator that denies admission for any reservation whose size, summed with the sizes already
+/// resident in the other slots, exceeds `budget` — the same shape as `WiredSumPolicy`'s clamp to
+/// `GPU.maxRecommendedWorkingSetBytes()`, without touching Metal.
+///
+/// `start(_:)` deliberately *hangs forever* on a denied ticket, mirroring the real
+/// `WiredMemoryTicket.start()` (documented: "If admission is denied, this suspends until capacity
+/// is available or the task is cancelled") and its unbounded `while !policy.canAdmit(...)` waiter
+/// loop in `WiredMemoryManager`. Any test that completes against this fake therefore proves the
+/// runtime never started a ticket that would have been denied.
+private final class DenyingCoordinator: WiredMemoryCoordinating, @unchecked Sendable {
+    private let lock = NSLock()
+    private let budget: Int
+    private var _started: [UUID] = []
+    private var _ended: [UUID] = []
+    private var _admissionQueries: [(size: Int, existing: [Int])] = []
+
+    init(budget: Int) { self.budget = budget }
+
+    var started: [UUID] { lock.withLock { _started } }
+    var ended: [UUID] { lock.withLock { _ended } }
+    var admissionQueries: [(size: Int, existing: [Int])] { lock.withLock { _admissionQueries } }
+
+    func canAdmitReservation(size: Int, alongside existingSizes: [Int]) -> Bool {
+        lock.withLock { _admissionQueries.append((size, existingSizes)) }
+        return existingSizes.reduce(0, +) + size <= budget
+    }
+
+    func start(_ ticket: WiredMemoryTicket) async {
+        if !canAdmitReservation(size: ticket.size, alongside: []) {
+            // The real manager parks here indefinitely. Never return.
+            await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+        }
+        lock.withLock { _started.append(ticket.id) }
+    }
+
+    func end(_ ticket: WiredMemoryTicket) async {
+        lock.withLock { _ended.append(ticket.id) }
+    }
+}
+
+final class MLXResidencyAdmissionTests: XCTestCase {
+
+    private let budget = 10_000_000
+
+    /// The core regression: a second slot whose weights would push the shared budget over the
+    /// policy's limit must not block `reserve(...)`. If the runtime started the ticket anyway,
+    /// `DenyingCoordinator.start` would never return and this test would time out.
+    func test_deniedAdmission_skipsReservationInsteadOfHanging() async {
+        let coordinator = DenyingCoordinator(budget: budget)
+        let runtime = MLXModelRuntime(coordinator: coordinator)
+
+        // .primary already holds a large model (as a download-triggered .auxiliary load would find).
+        await runtime.reserve(weightBytes: 8_000_000, for: .primary)
+        await runtime.test_markWeightBytes(8_000_000, for: .primary)
+
+        // 8 MB + 6 MB > the 10 MB budget => the policy would deny this reservation.
+        await runtime.reserve(weightBytes: 6_000_000, for: .auxiliary)
+
+        let auxTicket = await runtime.reservationTicketID(for: .auxiliary)
+        XCTAssertNil(
+            auxTicket,
+            "A reservation the policy would deny must be skipped, never started — starting it " +
+            "would suspend container(for:residency:) indefinitely in the manager's waiter loop"
+        )
+        XCTAssertEqual(
+            coordinator.started.count, 1,
+            "Only the admissible .primary reservation may be started"
+        )
+        let queries = coordinator.admissionQueries
+        XCTAssertEqual(
+            queries.last?.existing, [8_000_000],
+            "The pre-check must account for the weights already resident in the other slot"
+        )
+    }
+
+    /// A skipped reservation must leave no residue: nothing for the runtime to end, and no ticket
+    /// registered in the shared manager that the runtime has no record of.
+    func test_skippedReservation_leavesNoTicketToLeak() async {
+        let coordinator = DenyingCoordinator(budget: budget)
+        let runtime = MLXModelRuntime(coordinator: coordinator)
+
+        await runtime.test_markWeightBytes(9_000_000, for: .primary)
+        await runtime.reserve(weightBytes: 9_000_000, for: .auxiliary)
+
+        let reserved = await runtime.reservedResidencies
+        XCTAssertTrue(reserved.isEmpty, "A skipped reservation must not be recorded")
+        XCTAssertTrue(
+            coordinator.started.isEmpty,
+            "No ticket may reach the shared manager without a matching MLXModelRuntime entry"
+        )
+
+        // Releasing the slot afterwards must be a clean no-op — never an end() for a ticket that
+        // was never started (which trips WiredMemoryManager's DEBUG "Ticket not active" assert).
+        let didRelease = await runtime.releaseReservation(for: .auxiliary)
+        XCTAssertFalse(didRelease)
+        XCTAssertTrue(coordinator.ended.isEmpty)
+
+        // And releaseSlot (the MLXProvider.releaseResidency path) is equally clean.
+        await runtime.releaseSlot(.auxiliary)
+        XCTAssertTrue(coordinator.ended.isEmpty, "Nothing was started, so nothing may be ended")
+    }
+
+    /// The gate must not be over-eager: a reservation that fits is still taken normally.
+    func test_admissibleReservation_isStillStarted() async {
+        let coordinator = DenyingCoordinator(budget: budget)
+        let runtime = MLXModelRuntime(coordinator: coordinator)
+
+        await runtime.test_markWeightBytes(3_000_000, for: .primary)
+        await runtime.reserve(weightBytes: 4_000_000, for: .auxiliary)
+
+        let ticketID = await runtime.reservationTicketID(for: .auxiliary)
+        XCTAssertNotNil(ticketID, "A reservation that fits the budget must still be taken")
+        XCTAssertEqual(coordinator.started, [ticketID].compactMap { $0 })
+    }
+
+    /// Releasing the big model in the other slot must make the previously-denied size admissible
+    /// again — i.e. the gate reads live state, it isn't a permanent opt-out.
+    func test_reservationBecomesAdmissible_afterOtherSlotReleases() async {
+        let coordinator = DenyingCoordinator(budget: budget)
+        let runtime = MLXModelRuntime(coordinator: coordinator)
+
+        await runtime.test_markWeightBytes(8_000_000, for: .primary)
+        await runtime.reserve(weightBytes: 6_000_000, for: .auxiliary)
+        var auxTicket = await runtime.reservationTicketID(for: .auxiliary)
+        XCTAssertNil(auxTicket)
+
+        await runtime.releaseSlot(.primary)
+        await runtime.reserve(weightBytes: 6_000_000, for: .auxiliary)
+        auxTicket = await runtime.reservationTicketID(for: .auxiliary)
+        XCTAssertNotNil(auxTicket, "Once .primary is released, .auxiliary's reservation fits again")
+    }
+
+    /// `residentWeightBytes(in:)` must report the slot's real footprint even when its reservation
+    /// was skipped — that's what the host app's download gate reads.
+    func test_residentWeightBytes_reportedIndependentlyOfReservation() async {
+        let coordinator = DenyingCoordinator(budget: budget)
+        let runtime = MLXModelRuntime(coordinator: coordinator)
+
+        await runtime.test_markWeightBytes(8_000_000, for: .primary)
+        let bytes = await runtime.residentWeightBytes(in: .primary)
+        XCTAssertEqual(bytes, 8_000_000)
+
+        await runtime.releaseSlot(.primary)
+        let cleared = await runtime.residentWeightBytes(in: .primary)
+        XCTAssertNil(cleared, "Releasing a slot must clear its recorded footprint")
+    }
+}
+
 final class MLXResidencyReservationTests: XCTestCase {
 
     private let primaryBytes = 4_000_000
