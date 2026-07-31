@@ -1,5 +1,6 @@
 import Foundation
 import AIChatCore
+import MLX
 import MLXLLM
 import MLXVLM
 import MLXLMCommon
@@ -19,6 +20,29 @@ public enum MLXModelResidency: Sendable, Hashable {
     case auxiliary
 }
 
+/// Starts and ends wired-memory tickets on behalf of ``MLXModelRuntime``.
+///
+/// This exists purely as a seam: ``WiredMemoryTicket/start()`` reaches through to
+/// `Device.defaultDevice()`, which aborts under a command-line `swift test` run because SwiftPM
+/// does not compile MLX's Metal shader library. Residency bookkeeping is tested against a fake
+/// conformance; production always uses ``LiveWiredMemoryCoordinator``.
+protocol WiredMemoryCoordinating: Sendable {
+    func start(_ ticket: WiredMemoryTicket) async
+    func end(_ ticket: WiredMemoryTicket) async
+}
+
+/// Production coordinator — drives the real `WiredMemoryManager` through the ticket API.
+struct LiveWiredMemoryCoordinator: WiredMemoryCoordinating {
+    let manager: WiredMemoryManager
+
+    init(manager: WiredMemoryManager = .shared) {
+        self.manager = manager
+    }
+
+    func start(_ ticket: WiredMemoryTicket) async { _ = await ticket.start() }
+    func end(_ ticket: WiredMemoryTicket) async { _ = await ticket.end() }
+}
+
 /// Process-wide model residency manager. One conversational model and one small auxiliary routing
 /// model may be resident at once; loading a replacement into either slot releases only the model
 /// previously occupying that slot.
@@ -26,12 +50,77 @@ public enum MLXModelResidency: Sendable, Hashable {
 /// Conversational model weights are multi-gigabyte `MLXArray` buffers. Every `MLXProvider` routes
 /// loading through this actor so only one model occupies each residency slot and repeated requests
 /// reuse that slot's container. The auxiliary slot is intentionally limited to the small router.
-private actor MLXModelRuntime {
+///
+/// ## Wired-memory coordination
+///
+/// Both residency slots share a single ``MLXLMCommon/WiredSumPolicy`` (``residencyPolicy``). Every
+/// slot that holds loaded weights owns a `.reservation` wired-memory ticket sized to those weights,
+/// and every generation call takes an `.active` ticket for its KV cache + decode workspace. Because
+/// the policy sums all tickets in its group and clamps the result to
+/// `GPU.maxRecommendedWorkingSetBytes()`, the primary and auxiliary slots can never drive the
+/// process-wide wired limit past Apple's recommended working set — which is what previously let a
+/// large conversational model plus the router starve other applications of memory.
+///
+/// Deliberately no `MLX.GPU.set(cacheLimit:)`/`set(memoryLimit:)` call exists here: raw limits would
+/// fight with the ticket system's own limit management.
+actor MLXModelRuntime {
     static let shared = MLXModelRuntime()
+
+    /// Process-wide policy shared by *both* residency slots and by in-flight generation, so all
+    /// their ticket sizes are summed into one budget instead of being accounted independently.
+    ///
+    /// No explicit `cap:` — with `cap == nil` the policy clamps to
+    /// `GPU.maxRecommendedWorkingSetBytes()`, i.e. Apple's recommended working-set size for the
+    /// device. `WiredSumPolicy` is a value type whose identity (and therefore the manager's policy
+    /// grouping) is its `cap`, so every ticket created from this instance groups together.
+    static let residencyPolicy = MLXLMCommon.WiredSumPolicy()
+
+    /// Conservative fixed estimate for one generation's KV cache + decode workspace.
+    ///
+    /// This is a ceiling hint for the wired limit, not an allocation: erring small keeps the
+    /// process's wired footprint conservative. A precise per-call figure could be measured with
+    /// `WiredMemoryUtils.tune(...)`, at the cost of a synthetic prefill pass per request.
+    static let generationWorkspaceBytes = 512 * 1024 * 1024
+
+    /// Builds the `.active` ticket handed to `MLXLMCommon.generate(...)` for a single generation.
+    ///
+    /// `generate` owns the ticket's lifecycle via `WiredMemoryTicket.withWiredLimit`, so callers
+    /// must not `start()`/`end()` it themselves.
+    nonisolated static func makeGenerationTicket(
+        bytes: Int = MLXModelRuntime.generationWorkspaceBytes,
+        manager: WiredMemoryManager = .shared
+    ) -> WiredMemoryTicket {
+        WiredMemoryTicket(
+            size: bytes,
+            policy: residencyPolicy,
+            manager: manager,
+            kind: .active
+        )
+    }
+
+    private let manager: WiredMemoryManager
+    private let coordinator: any WiredMemoryCoordinating
 
     private var loadedModelNames: [MLXModelResidency: String] = [:]
     private var loadedContainers: [MLXModelResidency: ModelContainer] = [:]
     private var loadedRevisions: [MLXModelResidency: UInt64] = [:]
+
+    /// The live `.reservation` ticket for each slot's loaded weights. Keyed by slot so a slot's
+    /// reservation can be ended precisely when that slot is evicted or replaced, without touching
+    /// the other slot's reservation.
+    private var reservationTickets: [MLXModelResidency: WiredMemoryTicket] = [:]
+
+    /// - Parameters:
+    ///   - manager: Wired-memory manager the reservation tickets are bound to. Production uses the
+    ///     process-wide shared manager.
+    ///   - coordinator: Starts/ends those tickets. Tests substitute a device-free fake.
+    init(
+        manager: WiredMemoryManager = .shared,
+        coordinator: (any WiredMemoryCoordinating)? = nil
+    ) {
+        self.manager = manager
+        self.coordinator = coordinator ?? LiveWiredMemoryCoordinator(manager: manager)
+    }
 
     /// Returns the `ModelContainer` for `configuration`, loading it if needed. If a *different*
     /// model is currently resident, that container is dropped (allowing it to deallocate and
@@ -50,6 +139,9 @@ private actor MLXModelRuntime {
             return loadedContainer
         }
 
+        // Release this slot's wired-memory reservation before dropping its container, so the
+        // outgoing model's weights stop counting against the shared budget.
+        await releaseReservation(for: residency)
         loadedContainers[residency] = nil
         loadedModelNames[residency] = nil
 
@@ -62,8 +154,66 @@ private actor MLXModelRuntime {
         loadedContainers[residency] = container
         loadedModelNames[residency] = name
         loadedRevisions[residency, default: 0] &+= 1
+
+        // Register the newly resident weights in the shared wired-memory budget.
+        let weightBytes = await container.perform { ctx in
+            ctx.model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        }
+        await reserve(weightBytes: weightBytes, for: residency)
+
         return container
     }
+
+    // MARK: - Wired-memory reservations
+
+    /// Registers `weightBytes` of resident model weights for `residency` as a `.reservation` ticket
+    /// on the shared ``residencyPolicy``, replacing any reservation the slot already held.
+    ///
+    /// Reservation tickets participate in admission and limit computation but do not keep the wired
+    /// limit elevated on their own — they make the slot's weights visible in the shared budget
+    /// without wiring memory while the model sits idle.
+    func reserve(weightBytes: Int, for residency: MLXModelResidency) async {
+        await releaseReservation(for: residency)
+        guard weightBytes > 0 else { return }
+
+        let ticket = WiredMemoryTicket(
+            size: weightBytes,
+            policy: Self.residencyPolicy,
+            manager: manager,
+            kind: .reservation
+        )
+        // Stored before `start()` so a concurrent eviction that interleaves at the suspension
+        // point still finds (and ends) this ticket rather than leaking it.
+        reservationTickets[residency] = ticket
+        await coordinator.start(ticket)
+    }
+
+    /// Ends and clears `residency`'s reservation ticket, if it holds one.
+    ///
+    /// - Returns: `true` if a reservation was ended.
+    @discardableResult
+    func releaseReservation(for residency: MLXModelResidency) async -> Bool {
+        guard let ticket = reservationTickets.removeValue(forKey: residency) else { return false }
+        await coordinator.end(ticket)
+        return true
+    }
+
+    #if DEBUG
+        /// Test seam: size in bytes of `residency`'s live reservation ticket, if any.
+        func reservationSizeBytes(for residency: MLXModelResidency) -> Int? {
+            reservationTickets[residency]?.size
+        }
+
+        /// Test seam: identifier of `residency`'s live reservation ticket, if any.
+        func reservationTicketID(for residency: MLXModelResidency) -> UUID? {
+            reservationTickets[residency]?.id
+        }
+
+        /// Test seam: slots currently holding a reservation.
+        var reservedResidencies: Set<MLXModelResidency> {
+            Set(reservationTickets.keys)
+        }
+    #endif
 
     /// Returns the already-loaded `ModelContainer` for `configuration` without triggering a load
     /// — `nil` if `configuration`'s model isn't the currently-resident one.
@@ -309,6 +459,12 @@ public actor MLXProvider: ChatProvider {
                     let toolSpecs   = Self.toToolSpecs(options.tools) ?? options.nativeToolSpecs
                     let mlxMessages = Self.toMLXMessages(messages: messages, systemPrompt: options.systemPrompt)
 
+                    // Active wired-memory ticket for this generation's KV cache + decode
+                    // workspace, on the same shared policy as both slots' weight reservations.
+                    // `generate` starts/ends it internally (WiredMemoryTicket.withWiredLimit),
+                    // so it must not be started here.
+                    let wiredTicket = MLXModelRuntime.makeGenerationTicket()
+
                     let completionInfo: GenerateCompletionInfo? = try await container.perform { @Sendable ctx in
                         let userInput = UserInput(messages: mlxMessages, tools: toolSpecs)
                         let lmInput   = try await ctx.processor.prepare(input: userInput)
@@ -316,7 +472,8 @@ public actor MLXProvider: ChatProvider {
                             input: lmInput,
                             cache: nil,
                             parameters: params,
-                            context: ctx
+                            context: ctx,
+                            wiredMemoryTicket: wiredTicket
                         )
 
                         var processor = ModelStreamProcessor(

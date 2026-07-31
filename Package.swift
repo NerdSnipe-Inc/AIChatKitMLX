@@ -44,6 +44,9 @@ let package = Package(
             url: "https://github.com/ml-explore/mlx-swift-lm.git",
             from: "3.0.0"
         ),
+        // Same constraint mlx-swift-lm declares — MLX is needed directly for the wired-memory
+        // ticket types (`WiredMemoryTicket`, `WiredMemoryManager`) used to bound model residency.
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.9.0")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.2.1")),
     ],
@@ -52,6 +55,7 @@ let package = Package(
             name: "AIChatMLX",
             dependencies: [
                 .product(name: "AIChatCore", package: "AIChatKit"),
+                .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
@@ -61,6 +65,13 @@ let package = Package(
             ],
             path: "Sources/AIChatMLX"
         ),
-        .testTarget(name: "AIChatMLXTests", dependencies: ["AIChatMLX"], path: "Tests/AIChatMLXTests"),
+        .testTarget(
+            name: "AIChatMLXTests",
+            dependencies: [
+                "AIChatMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/AIChatMLXTests"
+        ),
     ]
 )
