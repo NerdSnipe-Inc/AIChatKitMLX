@@ -204,6 +204,77 @@ final class MLXResidencyReservationTests: XCTestCase {
         XCTAssertEqual(stillLive.map(\.id), [auxiliaryID])
     }
 
+    // MARK: - Force-release without replacement (releaseSlot / MLXProvider.releaseResidency)
+
+    func test_releaseSlot_clearsResidentModelNameAndReservation() async {
+        let (runtime, coordinator) = makeRuntime()
+
+        await runtime.reserve(weightBytes: primaryBytes, for: .primary)
+        await runtime.test_markLoaded(name: "mlx-community/gemma-4-e4b-it-4bit", for: .primary)
+        guard let ticketID = await runtime.reservationTicketID(for: .primary) else {
+            return XCTFail("Expected a reservation ticket for .primary")
+        }
+        let stillLoadedBeforeRelease = await runtime.isModelNameLoaded(
+            "mlx-community/gemma-4-e4b-it-4bit", for: .primary
+        )
+        XCTAssertTrue(stillLoadedBeforeRelease)
+
+        await runtime.releaseSlot(.primary)
+
+        let loadedAfterRelease = await runtime.isModelNameLoaded(
+            "mlx-community/gemma-4-e4b-it-4bit", for: .primary
+        )
+        XCTAssertFalse(
+            loadedAfterRelease,
+            "releaseSlot must clear the resident model name so a subsequent " +
+            "container(for:residency:) call for the same name re-triggers loadModelContainer " +
+            "rather than reusing the (now-dropped) container"
+        )
+        let stillHeld = await runtime.reservationTicketID(for: .primary)
+        XCTAssertNil(stillHeld, "releaseSlot must end and clear the slot's reservation ticket")
+
+        let ended = await coordinator.ended
+        XCTAssertEqual(
+            ended.map(\.id), [ticketID],
+            "Exactly the released slot's reservation ticket must be ended"
+        )
+    }
+
+    func test_releaseSlot_leavesOtherSlotUntouched() async {
+        let (runtime, coordinator) = makeRuntime()
+
+        await runtime.reserve(weightBytes: primaryBytes, for: .primary)
+        await runtime.reserve(weightBytes: auxiliaryBytes, for: .auxiliary)
+        await runtime.test_markLoaded(name: "primary-model", for: .primary)
+        await runtime.test_markLoaded(name: "aux-model", for: .auxiliary)
+
+        await runtime.releaseSlot(.primary)
+
+        let primaryStillLoaded = await runtime.isModelNameLoaded("primary-model", for: .primary)
+        let auxStillLoaded = await runtime.isModelNameLoaded("aux-model", for: .auxiliary)
+        XCTAssertFalse(primaryStillLoaded)
+        XCTAssertTrue(
+            auxStillLoaded,
+            "Releasing .primary must not affect .auxiliary's resident model"
+        )
+        let auxTicket = await runtime.reservationTicketID(for: .auxiliary)
+        XCTAssertNotNil(auxTicket, "Releasing .primary must not end .auxiliary's reservation")
+
+        let ended = await coordinator.ended
+        XCTAssertEqual(ended.count, 1, "Only the released slot's reservation may be ended")
+    }
+
+    func test_releaseSlot_onEmptySlot_isNoOp() async {
+        let (runtime, coordinator) = makeRuntime()
+
+        await runtime.releaseSlot(.primary)
+
+        let loaded = await runtime.isModelNameLoaded("anything", for: .primary)
+        XCTAssertFalse(loaded)
+        let ended = await coordinator.ended
+        XCTAssertTrue(ended.isEmpty, "Releasing an already-empty slot must not end any ticket")
+    }
+
     // MARK: - Generation tickets share the same policy
 
     func test_generationTicket_isActiveKindOnSharedPolicy() {

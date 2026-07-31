@@ -213,7 +213,34 @@ actor MLXModelRuntime {
         var reservedResidencies: Set<MLXModelResidency> {
             Set(reservationTickets.keys)
         }
+
+        /// Test seam: directly records `name` as resident for `residency`, bypassing the real
+        /// downloader/loader. Lets release-path tests simulate a loaded slot without a Metal
+        /// device or network access — `container(for:residency:)`'s reuse check only compares
+        /// `loadedModelNames`, so this is enough to exercise that check.
+        func test_markLoaded(name: String, for residency: MLXModelResidency) {
+            loadedModelNames[residency] = name
+        }
+
+        /// Test seam: whether `residency` currently has `name` recorded as its resident model —
+        /// i.e. whether `container(for:residency:)`'s reuse check would treat it as already loaded.
+        func isModelNameLoaded(_ name: String, for residency: MLXModelResidency) -> Bool {
+            loadedModelNames[residency] == name
+        }
     #endif
+
+    /// Force-releases `residency`'s resident container reference and ends its reservation
+    /// ticket, without loading a replacement.
+    ///
+    /// Used by ``MLXProvider/releaseResidency(_:)`` so callers outside the package can tear
+    /// down a slot's old model immediately — e.g. when the app switches to a different model —
+    /// instead of waiting for the next `container(for:residency:)` call (which only evicts the
+    /// slot's previous occupant when a *different* model name is requested) to release it lazily.
+    func releaseSlot(_ residency: MLXModelResidency) async {
+        await releaseReservation(for: residency)
+        loadedContainers[residency] = nil
+        loadedModelNames[residency] = nil
+    }
 
     /// Returns the already-loaded `ModelContainer` for `configuration` without triggering a load
     /// — `nil` if `configuration`'s model isn't the currently-resident one.
@@ -368,6 +395,22 @@ public actor MLXProvider: ChatProvider {
             topP: topP,
             repetitionPenalty: repetitionPenalty
         )
+    }
+
+    // MARK: - Residency release
+
+    /// Force-releases `residency`'s resident model and its wired-memory reservation, without
+    /// loading a replacement.
+    ///
+    /// Call this before switching to a different model for the same slot (e.g. the user picks a
+    /// new model in Model Manager) so the outgoing model's weights and reservation ticket are
+    /// torn down immediately, rather than only lazily on the next `loadModel`/`stream` call for a
+    /// *different* model name in that slot — closing the window where both the old and new
+    /// model's weight reservations could be resident at once.
+    ///
+    /// Safe to call when nothing is resident in `residency`: it is then a no-op.
+    public static func releaseResidency(_ residency: MLXModelResidency) async {
+        await MLXModelRuntime.shared.releaseSlot(residency)
     }
 
     // MARK: - Model management

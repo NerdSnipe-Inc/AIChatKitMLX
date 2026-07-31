@@ -256,3 +256,26 @@ final class MLXProviderHistoryTests: XCTestCase {
         XCTAssertEqual(role(result[0]), "user")
     }
 }
+
+// Tests for MLXProvider.releaseResidency — the public API that force-releases a residency
+// slot's resident model and reservation without loading a replacement.
+//
+// The exhaustive bookkeeping behavior (reservation ended, resident model name cleared, other
+// slot untouched) is covered against an injectable `MLXModelRuntime` + fake coordinator in
+// MLXResidencyReservationTests.swift, since that's the only way to exercise it without a
+// compiled Metal shader library. `releaseResidency` itself is hard-wired to
+// `MLXModelRuntime.shared` (by design — it's the process-wide singleton every `MLXProvider`
+// resolves through), so what's verified here is that the public entry point is callable and
+// safe when nothing is resident in the slot, i.e. it does not start/end a real wired-memory
+// ticket and does not crash under `swift test`.
+final class MLXProviderReleaseResidencyTests: XCTestCase {
+
+    func test_releaseResidency_isSafeNoOpWhenSlotNotLoaded() async {
+        // .auxiliary is not expected to hold a reservation from any other test in this process,
+        // so this exercises the no-ticket-to-end path — the only path safe to run here, since
+        // ending a real ticket would reach through to WiredMemoryManager's live coordinator,
+        // which probes Device.defaultDevice() and aborts without a compiled MLX metallib.
+        await MLXProvider.releaseResidency(.auxiliary)
+        // No crash, no throw: the API is callable and inert when the slot is already empty.
+    }
+}
