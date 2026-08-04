@@ -94,10 +94,43 @@ struct LiveWiredMemoryCoordinator: WiredMemoryCoordinating {
 /// process-wide wired limit past Apple's recommended working set — which is what previously let a
 /// large conversational model plus the router starve other applications of memory.
 ///
-/// Deliberately no `MLX.GPU.set(cacheLimit:)`/`set(memoryLimit:)` call exists here: raw limits would
-/// fight with the ticket system's own limit management.
+/// ## `memoryLimit`/`cacheLimit` are separate from the wired-ticket system above
+///
+/// `WiredMemoryManager` only ever calls `mlx_set_wired_limit` (confirmed by reading the pinned
+/// mlx-swift source, `Source/MLX/WiredMemory.swift`). `Memory.memoryLimit` (`mlx_set_memory_limit`)
+/// and `Memory.cacheLimit` (`mlx_set_cache_limit`, the buffer-reuse pool flagged as unbounded in
+/// the original memory-crisis investigation) are independent C-level ceilings the wired-ticket
+/// system never touches. Left at their library defaults, `memoryLimit` resolves to 1.5x
+/// `GPU.maxRecommendedWorkingSetBytes()` and `cacheLimit` tracks `memoryLimit` — on a 36 GB Mac
+/// that is ~42 GB, above physical RAM, with nothing to reclaim cached buffers before the OS itself
+/// starts killing other processes. ``configureMemoryLimitsIfNeeded()`` closes that gap explicitly.
 actor MLXModelRuntime {
     static let shared = MLXModelRuntime()
+
+    /// Set once, before the first model ever loads. `nonisolated(unsafe)` because it's read/written
+    /// only from within this actor's own `container(for:residency:progressHandler:)`, which is
+    /// itself actor-isolated — the flag never races.
+    nonisolated(unsafe) private static var hasConfiguredMemoryLimits = false
+
+    /// Caps `Memory.memoryLimit`/`Memory.cacheLimit` to the device's Metal-recommended working set
+    /// instead of MLX's own default (1.5x that value — see the type doc above for why that default
+    /// is unsafe on this app's supported hardware). Idempotent; safe to call on every load.
+    private static func configureMemoryLimitsIfNeeded() {
+        guard !hasConfiguredMemoryLimits else { return }
+        hasConfiguredMemoryLimits = true
+        guard let recommended = GPU.maxRecommendedWorkingSetBytes() else {
+            // No queryable Metal device (e.g. a test host without GPU access) — leave MLX's own
+            // defaults rather than guess a number for hardware we can't measure.
+            return
+        }
+        Memory.memoryLimit = recommended
+        // The cache holds reclaimable-but-idle buffers, not resident model weights — keeping it a
+        // small fraction of the working set stops it from becoming a second uncapped ceiling on
+        // its own. 1/8 is our own conservative starting heuristic (Apple publishes no official
+        // per-app cache-sizing table, same caveat as this project's other derived heuristics);
+        // revisit with real Instruments profiling if generation throughput regresses.
+        Memory.cacheLimit = recommended / 8
+    }
 
     /// Process-wide policy shared by *both* residency slots and by in-flight generation, so all
     /// their ticket sizes are summed into one budget instead of being accounted independently.
@@ -179,6 +212,11 @@ actor MLXModelRuntime {
            loadedModelNames[residency] == name {
             return loadedContainer
         }
+
+        // Must happen before the first real model load — see the type doc for why the library
+        // defaults are unsafe. Idempotent, so calling it on every load (not just the very first)
+        // costs nothing.
+        Self.configureMemoryLimitsIfNeeded()
 
         // Release this slot's wired-memory reservation before dropping its container, so the
         // outgoing model's weights stop counting against the shared budget.
