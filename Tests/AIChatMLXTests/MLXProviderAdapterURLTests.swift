@@ -2,6 +2,17 @@ import XCTest
 @testable import AIChatMLX
 
 final class MLXProviderAdapterURLTests: XCTestCase {
+    func test_thinkingDefaultsOff() {
+        XCTAssertFalse(MLXProvider(modelId: "mlx-community/gemma-4-e4b-it-4bit").enableThinking)
+    }
+
+    func test_thinkingCanBeExplicitlyEnabled() {
+        XCTAssertTrue(MLXProvider(
+            modelId: "mlx-community/gemma-4-e4b-it-4bit",
+            enableThinking: true
+        ).enableThinking)
+    }
+
     func test_initWithAdapterURL_storesURL() {
         let url = URL(filePath: "/tmp/fake-adapter")
         let provider = MLXProvider(modelId: "mlx-community/gemma-4-e4b-it-4bit", adapterDirectoryURL: url)

@@ -450,6 +450,10 @@ public actor MLXProvider: ChatProvider {
 
     nonisolated private let configuration:      ModelConfiguration
     nonisolated private let generateParameters: GenerateParameters
+    /// Controls Gemma's Jinja `enable_thinking` flag. This is passed through the model's
+    /// documented `UserInput.additionalContext` channel instead of relying on the template
+    /// default (which is `true` for Gemma 4).
+    nonisolated let enableThinking: Bool
     nonisolated private let residency: MLXModelResidency
     nonisolated private let streamSyntax: StreamSyntax
     private var loadedAdapter:                  LoRAContainer?
@@ -474,6 +478,8 @@ public actor MLXProvider: ChatProvider {
     ///   - temperature: Sampling temperature for generation.
     ///   - topP: Nucleus sampling probability mass.
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
+    ///   - enableThinking: Whether Gemma may emit its private thought channel. Defaults to
+    ///     `false` so local reasoning is never generated unless a caller explicitly opts in.
     public init(
         modelId: String = MLXProvider.defaultModelId,
         adapterDirectoryURL: URL? = nil,
@@ -482,7 +488,8 @@ public actor MLXProvider: ChatProvider {
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
-        repetitionPenalty: Float? = nil
+        repetitionPenalty: Float? = nil,
+        enableThinking: Bool = false
     ) {
         self.configuration = ModelConfiguration(id: modelId)
         self.adapterDirectoryURL = adapterDirectoryURL
@@ -491,6 +498,7 @@ public actor MLXProvider: ChatProvider {
         self.streamSyntax = modelId.lowercased().contains("functiongemma")
             ? .functionGemma
             : .gemma4
+        self.enableThinking = enableThinking
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -508,6 +516,8 @@ public actor MLXProvider: ChatProvider {
     ///   - temperature: Sampling temperature for generation.
     ///   - topP: Nucleus sampling probability mass.
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
+    ///   - enableThinking: Whether Gemma may emit its private thought channel. Defaults to
+    ///     `false` so local reasoning is never generated unless a caller explicitly opts in.
     public init(
         modelPath: URL,
         adapterDirectoryURL: URL? = nil,
@@ -516,7 +526,8 @@ public actor MLXProvider: ChatProvider {
         maxTokens: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
-        repetitionPenalty: Float? = nil
+        repetitionPenalty: Float? = nil,
+        enableThinking: Bool = false
     ) {
         self.configuration = ModelConfiguration(directory: modelPath)
         self.adapterDirectoryURL = adapterDirectoryURL
@@ -525,6 +536,7 @@ public actor MLXProvider: ChatProvider {
         self.streamSyntax = modelPath.path.lowercased().contains("functiongemma")
             ? .functionGemma
             : .gemma4
+        self.enableThinking = enableThinking
         self.generateParameters = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -662,7 +674,11 @@ public actor MLXProvider: ChatProvider {
                     let wiredTicket = MLXModelRuntime.makeGenerationTicket()
 
                     let completionInfo: GenerateCompletionInfo? = try await container.perform { @Sendable ctx in
-                        let userInput = UserInput(messages: mlxMessages, tools: toolSpecs)
+                        let userInput = UserInput(
+                            messages: mlxMessages,
+                            tools: toolSpecs,
+                            additionalContext: ["enable_thinking": self.enableThinking]
+                        )
                         let lmInput   = try await ctx.processor.prepare(input: userInput)
                         let stream    = try MLXLMCommon.generate(
                             input: lmInput,
