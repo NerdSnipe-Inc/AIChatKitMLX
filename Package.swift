@@ -18,7 +18,18 @@ private func siblingOrRemote(
         .standardized
         .appendingPathComponent("Package.swift")
 
-    let forceRemote = ProcessInfo.processInfo.environment["SPI_PROCESSING"] != nil
+    // SwiftPM checks out every remote dependency as a sibling folder under one shared
+    // `checkouts/` directory (Xcode: `SourcePackages/checkouts/`, plain `swift build`:
+    // `.build/checkouts/`) — when THIS package is itself being resolved remotely, that
+    // coincidentally makes `../AIChatKit` (or similar) resolve to a real sibling checkout that
+    // happens to exist for an unrelated reason, not a genuine local monorepo dev setup. Without
+    // this check, a consumer resolving this package remotely while ALSO depending on the sibling
+    // package directly hits a SwiftPM "conflicting identity" resolution failure — the sibling
+    // gets referenced once via this package's local `path:` and once via the consumer's own
+    // `url:`, and SwiftPM refuses to treat those as the same package.
+    let isSwiftPMCheckout = packageDirectory.path.contains("/checkouts/")
+    let forceRemote = isSwiftPMCheckout
+        || ProcessInfo.processInfo.environment["SPI_PROCESSING"] != nil
         || ProcessInfo.processInfo.environment["FORCE_REMOTE_PACKAGES"] != nil
 
     if !forceRemote, FileManager.default.fileExists(atPath: siblingManifest.path) {
