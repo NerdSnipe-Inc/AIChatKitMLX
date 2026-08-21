@@ -18,8 +18,8 @@ Adds on-device Apple MLX inference to any app already using [AIChatKit](https://
 
 ```swift
 // Package.swift
-.package(url: "https://github.com/NerdSnipe-Inc/AIChatKit",    from: "0.1.0"),
-.package(url: "https://github.com/NerdSnipe-Inc/AIChatKitMLX", from: "0.1.0"),
+.package(url: "https://github.com/NerdSnipe-Inc/AIChatKit",    from: "1.1.0"),
+.package(url: "https://github.com/NerdSnipe-Inc/AIChatKitMLX", from: "1.1.0"),
 
 // Target dependencies
 .product(name: "AIChatCore", package: "AIChatKit"),
