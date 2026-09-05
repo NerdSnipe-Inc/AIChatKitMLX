@@ -60,12 +60,25 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.9.0")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.2.1")),
+        // `AIChatCore.ChatRequestOptions.ToolDefinition` publicly exposes a `JSONSchema.JSONSchema`
+        // value (see AIChatKit's own Package.swift), and `MLXProvider.toToolSpecs` touches that
+        // type — so `AIChatMLX`'s own compiled object needs `JSONSchema`'s metadata/witness
+        // tables at link time even though no file in this target ever writes `import JSONSchema`
+        // itself. Plain `swift build`/`swift test` never surfaced this (SwiftPM CLI links the
+        // whole dependency graph into one binary, which happens to satisfy the symbol
+        // regardless), but Xcode's native package integration builds every product as its own
+        // separate dynamic framework and only auto-links a target's *declared* dependencies —
+        // without this, any Xcode-project consumer hits "Undefined symbols ... type metadata
+        // accessor for JSONSchema.JSONSchema" linking `AIChatMLX`. Version pinned to match
+        // AIChatKit's own requirement on this package exactly.
+        .package(url: "https://github.com/kevinhermawan/swift-json-schema.git", .upToNextMajor(from: "2.0.1")),
     ],
     targets: [
         .target(
             name: "AIChatMLX",
             dependencies: [
                 .product(name: "AIChatCore", package: "AIChatKit"),
+                .product(name: "JSONSchema", package: "swift-json-schema"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
