@@ -48,12 +48,15 @@ let package = Package(
         siblingOrRemote(
             siblingRelativePath: "../AIChatKit",
             url: "https://github.com/NerdSnipe-Inc/AIChatKit.git",
-            from: "1.1.0"
+            from: "1.1.2"
         ),
         // Third-party (ml-explore) — always resolved from upstream, never from a sibling folder.
         // A locally hand-edited or half-cloned `../mlx-swift-lm` used to silently shadow it here,
         // making builds depend on whatever happened to be in that folder.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.0.0"),
+        // 3.31.4 is the floor: earlier versions crash on Gemma 4 whenever a repetition penalty is set
+        // (`RepetitionContext` read the token count from the batch dimension of the `[1, N]` prompt
+        // array — `[broadcast_shapes] Shapes (20) and (N+19)`). Fixed upstream in 3.31.4.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.4"),
         // Same constraint mlx-swift-lm declares — MLX is needed directly for the wired-memory
         // ticket types (`WiredMemoryTicket`, `WiredMemoryManager`) used to bound model residency.
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),

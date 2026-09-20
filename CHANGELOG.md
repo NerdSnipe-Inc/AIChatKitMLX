@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-20
+
+### Fixed
+- Requires `mlx-swift-lm` 3.31.4 or later (was any 3.x). On 3.31.3 and earlier the default model
+  `gemma-4-e4b-it-4bit` does not load at all (`Key language_model.model.layers.24.self_attn.k_norm.weight
+  not found in Gemma4Attention.RMSNorm`), and Gemma 4 generation crashes whenever a repetition
+  penalty is set (`[broadcast_shapes] Shapes (20) and (N+19)`: the penalty's token ring read the
+  prompt length from the batch dimension of the `[1, N]` array Gemma 4 supplies). Both are fixed in
+  3.31.4; the floor stops an older resolved version from reintroducing them.
+- Requires `AIChatKit` 1.1.2 or later, which reports a model that is present but fails to load
+  (like the case above) as a load failure with its real cause, instead of "model not found".
+
 ## [1.3.0] - 2026-09-20
 
 ### Added
