@@ -1,5 +1,10 @@
 # AIChatKitMLX
 
+![Swift 5.10](https://img.shields.io/badge/Swift-5.10-orange?logo=swift)
+![iOS 17+](https://img.shields.io/badge/iOS-17%2B-blue?logo=apple)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-blue?logo=apple)
+![MIT License](https://img.shields.io/badge/license-MIT-green)
+![SPM](https://img.shields.io/badge/SPM-compatible-brightgreen)
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FNerdSnipe-Inc%2FAIChatKitMLX%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/NerdSnipe-Inc/AIChatKitMLX)
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FNerdSnipe-Inc%2FAIChatKitMLX%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/NerdSnipe-Inc/AIChatKitMLX)
 
