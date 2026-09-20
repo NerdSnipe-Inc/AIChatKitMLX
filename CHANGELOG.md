@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-20
+
 ### Added
 
-- `ToolRoutingProvider`: a two-stage `ChatProvider` that puts a small tool router (FunctionGemma-270M
+- **Experimental, opt-in:** `ToolRoutingProvider`, a two-stage `ChatProvider` that puts a small tool router (FunctionGemma-270M
   via `ToolRoutingProvider.onDevice()`) in front of a responder (Gemma 4). Validated tool calls are
   emitted without invoking the responder; everything else goes to the responder with the tool schemas
   removed. Configurable fallback / after-tool-result policies, router time budget, `requiresTool`
