@@ -50,11 +50,10 @@ let package = Package(
             url: "https://github.com/NerdSnipe-Inc/AIChatKit.git",
             from: "1.0.0"
         ),
-        siblingOrRemote(
-            siblingRelativePath: "../mlx-swift-lm",
-            url: "https://github.com/ml-explore/mlx-swift-lm.git",
-            from: "3.0.0"
-        ),
+        // Third-party (ml-explore) — always resolved from upstream, never from a sibling folder.
+        // A locally hand-edited or half-cloned `../mlx-swift-lm` used to silently shadow it here,
+        // making builds depend on whatever happened to be in that folder.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.0.0"),
         // Same constraint mlx-swift-lm declares — MLX is needed directly for the wired-memory
         // ticket types (`WiredMemoryTicket`, `WiredMemoryManager`) used to bound model residency.
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
