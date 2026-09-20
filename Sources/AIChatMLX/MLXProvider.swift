@@ -286,8 +286,9 @@ actor MLXModelRuntime {
             .filter { $0.key != residency }
             .map(\.value)
         guard coordinator.canAdmitReservation(size: weightBytes, alongside: otherSlotSizes) else {
-            print(
-                "[MLXModelRuntime] Skipping wired-memory reservation for \(residency) " +
+            ChatLog.warning(
+                .mlx,
+                "Skipping wired-memory reservation for \(residency) " +
                 "(\(weightBytes) bytes alongside \(otherSlotSizes)) — admission would be denied. " +
                 "Weights remain resident; only the shared wired-limit accounting is conservative."
             )
@@ -597,22 +598,47 @@ public actor MLXProvider: ChatProvider {
         // loadModelContainer (inside MLXModelRuntime) tries MLXVLM's factory first, then
         // MLXLLM, automatically routing to the right architecture. Importing MLXVLM above is
         // required to register its TrampolineModelFactory.
-        _ = try await MLXModelRuntime.shared.container(
-            for: configuration,
-            residency: residency,
-            progressHandler: handler
-        )
+        let modelId = configuration.name
+        let started = ContinuousClock.now
+        ChatLog.info(.model, "Loading model \(modelId)")
+        do {
+            _ = try await MLXModelRuntime.shared.container(
+                for: configuration,
+                residency: residency,
+                progressHandler: handler
+            )
+            ChatLog.info(.model, "Loaded model \(modelId) in \(started.duration(to: .now))")
+        } catch {
+            throw Self.mapAndLog(error, modelId: modelId, phase: .load)
+        }
+    }
+
+    /// Classifies `error`, logs it (never as an error for cancellation) and returns the value to throw.
+    private static func mapAndLog(_ error: Error, modelId: String, phase: ChatError.Phase) -> ChatError {
+        let mapped = ChatError.classify(error, modelId: modelId, phase: phase)
+        if case .cancelled = mapped {
+            ChatLog.debug(.model, "Operation cancelled (\(phase))")
+            return mapped
+        }
+        ChatLog.error(.model, "\(phase == .load ? "Model load" : "Generation") failed (\(mapped.caseName)) for \(modelId)", underlying: error)
+        ChatLog.debug(.model, mapped.debugDescription)
+        return mapped
     }
 
     /// Resolves this provider's `ModelContainer` via `MLXModelRuntime.shared`, loading it first
     /// if needed. Always fetched fresh (never cached on this instance) — see `loadModel`'s doc
     /// comment.
     private func resolvedContainer() async throws -> ModelContainer {
-        let container = try await MLXModelRuntime.shared.container(
-            for: configuration,
-            residency: residency,
-            progressHandler: { _ in }
-        )
+        let container: ModelContainer
+        do {
+            container = try await MLXModelRuntime.shared.container(
+                for: configuration,
+                residency: residency,
+                progressHandler: { _ in }
+            )
+        } catch {
+            throw Self.mapAndLog(error, modelId: configuration.name, phase: .load)
+        }
         let revision = await MLXModelRuntime.shared.revision(
             for: configuration,
             residency: residency
@@ -638,7 +664,7 @@ public actor MLXProvider: ChatProvider {
                 try await loadAdapter(at: url)
             } catch {
                 if adapterLoadingPolicy == .required { throw error }
-                print("[MLXProvider] Adapter load failed (using base model): \(error.localizedDescription)")
+                ChatLog.warning(.model, "Adapter load failed (using base model): \(error.localizedDescription)")
             }
         }
         return container
@@ -659,8 +685,11 @@ public actor MLXProvider: ChatProvider {
         options: ChatRequestOptions
     ) -> AsyncThrowingStream<ChatStreamEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
+                let modelId = self.configuration.name
+                let started = ContinuousClock.now
                 do {
+                    ChatLog.debug(.stream, "stream start: model=\(modelId) messages=\(messages.count) tools=\(options.tools?.count ?? 0) thinking=\(self.enableThinking)")
                     let container = try await self.resolvedContainer()
 
                     let params      = self.generateParameters
@@ -695,7 +724,12 @@ public actor MLXProvider: ChatProvider {
                         var info: GenerateCompletionInfo?
 
                         for await generation in stream {
-                            guard !Task.isCancelled else { break }
+                            // Surface consumer cancellation as CancellationError so it maps to
+                            // `.cancelled` instead of finishing as a (truncated) success.
+                            try Task.checkCancellation()
+                            if ChatLog.debugMode {
+                                ChatLog.debug(.stream, "raw: toolCall=\(generation.toolCall != nil) chunkChars=\(generation.chunk?.count ?? 0) info=\(generation.info != nil)")
+                            }
 
                             if let nativeCall = generation.toolCall {
                                 let argsJSON = Self.serializeArguments(nativeCall.function.arguments)
@@ -745,6 +779,7 @@ public actor MLXProvider: ChatProvider {
                     }
 
                     if let info = completionInfo {
+                        ChatLog.debug(.stream, "usage: prompt=\(info.promptTokenCount) completion=\(info.generationTokenCount) tps=\(info.tokensPerSecond) elapsed=\(started.duration(to: .now))")
                         continuation.yield(.usage(TokenUsage(
                             promptTokens:     info.promptTokenCount,
                             completionTokens: info.generationTokenCount,
@@ -754,12 +789,15 @@ public actor MLXProvider: ChatProvider {
 
                     continuation.yield(.done)
                     continuation.finish()
-                } catch is CancellationError {
-                    continuation.finish(throwing: ChatError.cancelled)
+                } catch let chatError as ChatError {
+                    // Already classified (model load, invalid configuration, ...).
+                    continuation.finish(throwing: chatError)
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: Self.mapAndLog(error, modelId: modelId, phase: .generate))
                 }
             }
+            // Cancelling the consumer (or dropping the stream) must stop generation.
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -817,7 +855,7 @@ public actor MLXProvider: ChatProvider {
             for: configuration,
             residency: residency
         )
-        print("[MLXProvider] Adapter loaded from \(path.lastPathComponent)")
+        ChatLog.info(.model, "Adapter loaded from \(path.lastPathComponent)")
     }
 
     /// Unloads the currently active LoRA adapter, if any.
@@ -833,7 +871,7 @@ public actor MLXProvider: ChatProvider {
         }
         loadedAdapter = nil
         loadedAdapterRevision = nil
-        print("[MLXProvider] Adapter unloaded")
+        ChatLog.info(.model, "Adapter unloaded")
     }
 
     // MARK: - Private helpers
