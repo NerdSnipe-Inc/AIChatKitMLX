@@ -70,22 +70,15 @@ Read `docs/TOOL_ROUTING.md` first: the router is a small model and can miss requ
 
 ## Model selection
 
-`MLXProvider` automatically selects a model based on the device's available RAM:
-
-| Device | Model | Type | Download size |
-|--------|-------|------|---------------|
-| macOS ≥ 16 GB RAM | `mlx-community/diffusiongemma-26B-A4B-it-4bit` | VLM (text + images) | ~8–10 GB |
-| macOS < 16 GB / iOS | `mlx-community/gemma-4-e4b-it-4bit` | LLM (text only) | ~2–3 GB |
-
-The 26B model is a Mixture-of-Experts architecture with ~4B active parameters per forward pass — faster and leaner than a dense 26B model while retaining broad capability. The factory is selected automatically: VLMs load via `MLXVLM`, text models via `MLXLLM`.
+`MLXProvider.recommendedModelId()` always returns the small text-only model (`mlx-community/gemma-4-e4b-it-4bit`, ~2–3 GB download; it runs on any Apple Silicon device with ≥ 8 GB RAM). The large model (`mlx-community/gemma-4-31b-it-4bit`) is opt-in: the host app must choose it and enforce its unified-memory requirement. VLMs load via `MLXVLM`, text models via `MLXLLM`.
 
 ```swift
-// Check which model will be used on the current device
+// The model used by default (always the small one)
 let modelId = MLXProvider.recommendedModelId()
 
 // Named constants
 MLXProvider.smallModelId  // gemma-4-e4b-it-4bit
-MLXProvider.largeModelId  // diffusiongemma-26B-A4B-it-4bit
+MLXProvider.largeModelId  // gemma-4-31b-it-4bit
 ```
 
 ---
@@ -149,6 +142,16 @@ Models are cached by the Hugging Face Swift library.
 | Not sandboxed | `~/.cache/huggingface/hub/` |
 
 The cache is shared with the Python `huggingface_hub` library — models already downloaded via Python tools are found without re-downloading.
+
+---
+
+## Known limits
+
+- **Requires `mlx-swift-lm` 3.31.4 or later.** On 3.31.3 and earlier `gemma-4-e4b-it-4bit` fails to load (`Key language_model.model.layers.24.self_attn.k_norm.weight not found`) and a repetition penalty crashes Gemma 4 generation. See the 1.3.1 entry in [CHANGELOG.md](CHANGELOG.md).
+- **Limited live coverage.** The live tests (in the AICompleteChat repo, not this package) exercise `gemma-4-e4b-it-4bit` and, for routing, `functiongemma-270m`. The large model, other Gemma variants and other FunctionGemma variants are not covered by live tests.
+- **`ToolRoutingProvider` is experimental and opt-in.** Stock FunctionGemma was less accurate and slower than Gemma 4's own tool calling in the measurements in [docs/TOOL_ROUTING.md](docs/TOOL_ROUTING.md); read it before enabling.
+- **Router plus responder are both resident.** The router adds roughly 0.8 GB of weights on top of the responder (figures in the Memory section of [docs/TOOL_ROUTING.md](docs/TOOL_ROUTING.md#memory)).
+- **Plain `swift test` cannot load the MLX Metal shaders.** Run the tests with `xcodebuild test -scheme AIChatKitMLX -destination 'platform=macOS' -skipMacroValidation`.
 
 ---
 
