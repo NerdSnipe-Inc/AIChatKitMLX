@@ -70,7 +70,7 @@ Read `docs/TOOL_ROUTING.md` first: the router is a small model and can miss requ
 
 ## Model selection
 
-`MLXProvider.recommendedModelId()` always returns the small text-only model (`mlx-community/gemma-4-e4b-it-4bit`, ~2–3 GB download; it runs on any Apple Silicon device with ≥ 8 GB RAM). The large model (`mlx-community/gemma-4-31b-it-4bit`) is opt-in: the host app must choose it and enforce its unified-memory requirement. VLMs load via `MLXVLM`, text models via `MLXLLM`.
+`MLXProvider.recommendedModelId()` always returns the small text-only model (`mlx-community/gemma-4-e4b-it-4bit`; the source describes it as fitting any Apple Silicon device with ≥ 8 GB RAM). The large model (`mlx-community/gemma-4-31b-it-4bit`) is opt-in: the host app must choose it and enforce its unified-memory requirement. VLMs load via `MLXVLM`, text models via `MLXLLM`.
 
 ```swift
 // The model used by default (always the small one)
