@@ -49,6 +49,25 @@ let provider = MLXProvider()
 
 ---
 
+## Tool routing (FunctionGemma router + Gemma 4 responder)
+
+`ToolRoutingProvider` puts a tiny router in front of the responder: the router decides whether a
+turn needs a tool (and with which arguments); chat turns skip tool-schema prompt cost, and tool turns
+skip the big model until the result has to be phrased.
+
+```swift
+let provider = ToolRoutingProvider.onDevice(          // FunctionGemma (.auxiliary slot) + Gemma 4 (.primary)
+    onDecision: { print($0.outcome, $0.reason) }       // optional diagnostics
+)
+await provider.warmUp()                                // keep the router's cold load out of its time budget
+
+let session = ChatSession(provider: provider, model: "", options: options) // options carries your tools
+```
+
+Read `docs/TOOL_ROUTING.md` first: the router is a small model and can miss required tool calls.
+
+---
+
 ## Model selection
 
 `MLXProvider` automatically selects a model based on the device's available RAM:

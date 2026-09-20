@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ToolRoutingProvider`: a two-stage `ChatProvider` that puts a small tool router (FunctionGemma-270M
+  via `ToolRoutingProvider.onDevice()`) in front of a responder (Gemma 4). Validated tool calls are
+  emitted without invoking the responder; everything else goes to the responder with the tool schemas
+  removed. Configurable fallback / after-tool-result policies, router time budget, `requiresTool`
+  escape hatch, and a `RoutingDecision` diagnostics callback. See `docs/TOOL_ROUTING.md` for measured
+  accuracy and latency — read it before enabling; stock FunctionGemma is markedly less reliable than
+  Gemma 4's own tool calling.
+
 ## [1.2.0] - 2026-09-20
 
 ### Changed
