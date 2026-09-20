@@ -48,7 +48,7 @@ let package = Package(
         siblingOrRemote(
             siblingRelativePath: "../AIChatKit",
             url: "https://github.com/NerdSnipe-Inc/AIChatKit.git",
-            from: "1.0.0"
+            from: "1.1.0"
         ),
         // Third-party (ml-explore) — always resolved from upstream, never from a sibling folder.
         // A locally hand-edited or half-cloned `../mlx-swift-lm` used to silently shadow it here,
