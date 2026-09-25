@@ -328,6 +328,12 @@ actor MLXModelRuntime {
             reservationTickets[residency]?.id
         }
 
+        /// Whether `name` is already loaded in `residency` — lets a load that must not download skip
+        /// its on-disk check for a model that's already in memory.
+        func isResident(name: String, in residency: MLXModelResidency) -> Bool {
+            loadedContainers[residency] != nil && loadedModelNames[residency] == name
+        }
+
         /// Test seam: slots currently holding a reservation.
         var reservedResidencies: Set<MLXModelResidency> {
             Set(reservationTickets.keys)
@@ -450,6 +456,11 @@ public actor MLXProvider: ChatProvider {
     // MARK: - Configuration
 
     nonisolated private let configuration:      ModelConfiguration
+    /// The Hugging Face repo id when this provider was built from `init(modelId:)`; `nil` for a
+    /// local `init(modelPath:)` directory. Only hub-backed models live in the Hub cache that
+    /// ``MLXModelManager`` inspects, so ``loadModel(downloadIfNeeded:progressHandler:)``'s
+    /// "installed?" check applies to them alone.
+    nonisolated private let hubModelId: String?
     nonisolated private let generateParameters: GenerateParameters
     /// Controls Gemma's Jinja `enable_thinking` flag. This is passed through the model's
     /// documented `UserInput.additionalContext` channel instead of relying on the template
@@ -493,6 +504,7 @@ public actor MLXProvider: ChatProvider {
         enableThinking: Bool = false
     ) {
         self.configuration = ModelConfiguration(id: modelId)
+        self.hubModelId = modelId
         self.adapterDirectoryURL = adapterDirectoryURL
         self.adapterLoadingPolicy = adapterLoadingPolicy
         self.residency = residency
@@ -531,6 +543,7 @@ public actor MLXProvider: ChatProvider {
         enableThinking: Bool = false
     ) {
         self.configuration = ModelConfiguration(directory: modelPath)
+        self.hubModelId = nil
         self.adapterDirectoryURL = adapterDirectoryURL
         self.adapterLoadingPolicy = adapterLoadingPolicy
         self.residency = residency
@@ -583,10 +596,24 @@ public actor MLXProvider: ChatProvider {
 
     /// Loads the configured model into memory if it is not already loaded.
     ///
-    /// - Parameter progressHandler: Optional callback receiving download/load progress updates.
+    /// - Parameters:
+    ///   - downloadIfNeeded: `true` (default, the historical behaviour) lets the load fetch missing
+    ///     weights from Hugging Face. Pass `false` from any *inference* path: if the model's
+    ///     weights aren't fully on disk it throws ``ChatError/modelNotFound(modelId:)`` immediately
+    ///     instead of silently starting a multi-gigabyte download behind a spinner. Downloads belong
+    ///     to ``MLXModelManager`` — one place, with progress, retry and recovery. Has no effect for
+    ///     a model already resident in memory or one built from a local `modelPath`.
+    ///   - progressHandler: Optional callback receiving download/load progress updates.
     public func loadModel(
+        downloadIfNeeded: Bool = true,
         progressHandler: (@Sendable (Progress) -> Void)? = nil
     ) async throws {
+        if !downloadIfNeeded, let hubModelId,
+           !(await MLXModelRuntime.shared.isResident(name: configuration.name, in: residency)),
+           !MLXModelManager.hasCompleteWeights(for: hubModelId) {
+            ChatLog.info(.model, "Refusing to load \(hubModelId): not installed and downloads are not allowed here")
+            throw ChatError.modelNotFound(modelId: hubModelId)
+        }
         let handler = progressHandler ?? { _ in }
         // Routed through `MLXModelRuntime.shared` rather than calling `loadModelContainer`
         // directly, and the result is intentionally NOT cached in a field on this instance —
