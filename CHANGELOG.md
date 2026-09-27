@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-27
+
+### Added
+- Accepts `AIChatKit` 1.1.2 up to (not including) 3.0.0, so it works with AIChatKit 2.x.
+- `MLXModelManager`: one owner for on-device model downloads (retry with backoff, waits while
+  offline, stall detection, resume after a quit, on-disk truth via `hasCompleteWeights`).
+- `Gemma4StreamProcessor` now turns tool calls the model wrote as plain text into tool-call events:
+  `<tool_call>{json}</tool_call>` blocks and ` ```tool_code ` fenced Python calls (a positional
+  argument takes its name from the tool schema). This is the recovery `AIChatUI` used to do on the
+  finished assistant text; it now happens at stream level, so the text never reaches the UI. A block
+  that does not parse, or never closes, is shown as text.
+
 ## [1.3.1] - 2026-09-20
 
 ### Fixed

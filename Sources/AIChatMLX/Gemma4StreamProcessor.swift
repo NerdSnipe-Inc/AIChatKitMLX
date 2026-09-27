@@ -1,7 +1,9 @@
 import Foundation
 
 /// Splits Gemma 4 streamed output into reasoning (thought channel), user-visible text,
-/// and native `call:name{...}` / `<|tool_call>` tool calls.
+/// and tool calls. Besides native `call:name{...}` / `<|tool_call>` calls it also recovers calls the
+/// model wrote as plain text (LoRA / Jinja-fallback artifacts): `<tool_call>{json}</tool_call>`
+/// blocks and ` ```tool_code ` fenced Python calls.
 public struct Gemma4StreamProcessor {
 
     /// Streaming events emitted by `Gemma4StreamProcessor`.
@@ -22,23 +24,32 @@ public struct Gemma4StreamProcessor {
         case response
         case thought
         case toolBlock
+        case xmlBlock
+        case pythonBlock
     }
 
     private static let thoughtStart = "<|channel>thought"
     private static let channelEnd = "<channel|>"
     private static let toolStart = "<|tool_call>"
     private static let toolEnd = "<tool_call|>"
+    private static let xmlStart = "<tool_call>"
+    private static let xmlEnd = "</tool_call>"
+    private static let pythonStart = "```tool_code"
+    private static let pythonEnd = "```"
     /// Markers that are recognised (and hidden from output) while in the response phase.
-    private static let responseMarkers = [thoughtStart, toolStart, channelEnd, toolEnd]
+    private static let responseMarkers = [thoughtStart, toolStart, channelEnd, toolEnd, xmlStart, pythonStart]
 
     private var phase: Phase = .response
     private var buffer = ""
+    /// Tool schemas, used to name the argument of a positional `tool_code` call.
+    private let tools: [[String: any Sendable]]?
 
     /// Creates a processor for a specific streamed response.
     ///
-    /// - Parameter tools: Retained for API compatibility; argument typing is derived from the
-    ///   call syntax itself (quoted strings vs bare numbers/booleans).
-    public init(tools: [[String: any Sendable]]?) {}
+    /// - Parameter tools: OpenAI-style tool specs. Argument typing for `call:` syntax comes from the
+    ///   syntax itself (quoted strings vs bare numbers/booleans); the specs are only consulted to
+    ///   name the parameter of a positional `tool_code` call such as `search("cats")`.
+    public init(tools: [[String: any Sendable]]?) { self.tools = tools }
 
     /// Ingests the next streamed token chunk and emits any parsed events.
     ///
@@ -75,6 +86,10 @@ public struct Gemma4StreamProcessor {
                 guard drainThought(&events, final: final) else { return events }
             case .toolBlock:
                 guard drainToolBlock(&events, final: final) else { return events }
+            case .xmlBlock:
+                guard drainXMLBlock(&events, final: final) else { return events }
+            case .pythonBlock:
+                guard drainPythonBlock(&events, final: final) else { return events }
             }
         }
     }
@@ -123,6 +138,8 @@ public struct Gemma4StreamProcessor {
             switch text {
             case Self.thoughtStart: phase = .thought
             case Self.toolStart: phase = .toolBlock
+            case Self.xmlStart: phase = .xmlBlock
+            case Self.pythonStart: phase = .pythonBlock
             default: break   // stray close markers are dropped
             }
             return true
@@ -165,6 +182,50 @@ public struct Gemma4StreamProcessor {
             buffer = ""
             phase = .response
             emitToolBlock(body, to: &events)
+        }
+        return false
+    }
+
+    /// `<tool_call>{json}</tool_call>`. Unparseable or unterminated blocks are shown as text.
+    private mutating func drainXMLBlock(_ events: inout [Event], final: Bool) -> Bool {
+        if let r = buffer.range(of: Self.xmlEnd) {
+            let body = String(buffer[..<r.lowerBound])
+            buffer = String(buffer[r.upperBound...])
+            phase = .response
+            if let call = GemmaTextToolCalls.parseXMLBody(body) {
+                events.append(.toolCall(name: call.name, argumentsJSON: call.argumentsJSON))
+            } else {
+                appendText(Self.xmlStart + body + Self.xmlEnd, to: &events)
+            }
+            return true
+        }
+        if final {
+            appendText(Self.xmlStart + buffer, to: &events)
+            buffer = ""
+            phase = .response
+        }
+        return false
+    }
+
+    /// ```` ```tool_code ```` fenced Python calls. A block with no parseable call, or one that never
+    /// closes, is shown as text.
+    private mutating func drainPythonBlock(_ events: inout [Event], final: Bool) -> Bool {
+        if let r = buffer.range(of: Self.pythonEnd) {
+            let body = String(buffer[..<r.lowerBound])
+            buffer = String(buffer[r.upperBound...])
+            phase = .response
+            let calls = GemmaTextToolCalls.parsePythonCalls(from: body, schemas: tools)
+            if calls.isEmpty {
+                appendText(Self.pythonStart + body + Self.pythonEnd, to: &events)
+            } else {
+                for c in calls { events.append(.toolCall(name: c.name, argumentsJSON: c.argumentsJSON)) }
+            }
+            return true
+        }
+        if final {
+            appendText(Self.pythonStart + buffer, to: &events)
+            buffer = ""
+            phase = .response
         }
         return false
     }
