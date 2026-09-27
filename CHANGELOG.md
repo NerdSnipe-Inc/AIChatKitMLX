@@ -9,15 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-09-27
 
+Model downloads get a single owner, and Gemma tool calls written as text are recovered at stream level.
+
 ### Added
+- `MLXModelManager`: one owner for on-device model files — download with retry and backoff, waits
+  while offline, stall detection, resume after a quit or crash, and on-disk truth
+  (`hasCompleteWeights`: a model is `.downloaded` only when every weight file is present). Observable
+  `states`, `retryNotices` and `storageUsedBytes`; `download`, `cancelDownload`, `delete`,
+  `track`, `resumePendingDownloads`; host policy via `admission` / `estimatedSizeBytes`.
+- `Gemma4StreamProcessor` turns tool calls the model wrote as plain text into tool-call events:
+  `<tool_call>{json}</tool_call>` blocks and ` ```tool_code ` fenced Python calls (a positional argument
+  takes its name from the tool schema). A block that does not parse, or never closes, is shown as text.
+  This is the recovery `AIChatUI` used to do on the finished assistant text; it now happens at stream
+  level, so the text never reaches the UI.
+
+### Changed
 - Accepts `AIChatKit` 1.1.2 up to (not including) 3.0.0, so it works with AIChatKit 2.x.
-- `MLXModelManager`: one owner for on-device model downloads (retry with backoff, waits while
-  offline, stall detection, resume after a quit, on-disk truth via `hasCompleteWeights`).
-- `Gemma4StreamProcessor` now turns tool calls the model wrote as plain text into tool-call events:
-  `<tool_call>{json}</tool_call>` blocks and ` ```tool_code ` fenced Python calls (a positional
-  argument takes its name from the tool schema). This is the recovery `AIChatUI` used to do on the
-  finished assistant text; it now happens at stream level, so the text never reaches the UI. A block
-  that does not parse, or never closes, is shown as text.
+
+### Upgrading from 1.3.x
+1. **Pair it with AIChatKit 2.0.0** if you can. AIChatKit 2.0.0 removed its own text recovery
+   (see its [changelog](https://github.com/NerdSnipe-Inc/AIChatKit/blob/main/CHANGELOG.md)); this release
+   is what replaces it. With AIChatKit 1.x nothing breaks — recovery just happens in both places.
+2. **Adopt `MLXModelManager` for downloads (recommended).** Hold one instance, call
+   `track([modelId])` at launch, then `await download(modelId:)` if `state(for:)` is not
+   `.downloaded`; drive your UI from `states[modelId]` and `retryNotices[modelId]`. Then load with
+   `provider.loadModel(downloadIfNeeded: false)` so a load can never start a hidden download. Hosts that
+   keep calling `loadModel()` with the default still work, without retry or resume.
+3. No API was removed.
 
 ## [1.3.1] - 2026-09-20
 
