@@ -317,6 +317,13 @@ actor MLXModelRuntime {
         return true
     }
 
+    /// Whether `name` is already loaded in `residency` — lets `loadModel(downloadIfNeeded: false)` skip
+    /// its on-disk check for a model that's already in memory. Production code (not a test seam): it
+    /// must not be `#if DEBUG`-only, or a Release build of `loadModel` silently loses this check.
+    func isResident(name: String, in residency: MLXModelResidency) -> Bool {
+        loadedContainers[residency] != nil && loadedModelNames[residency] == name
+    }
+
     #if DEBUG
         /// Test seam: size in bytes of `residency`'s live reservation ticket, if any.
         func reservationSizeBytes(for residency: MLXModelResidency) -> Int? {
@@ -326,12 +333,6 @@ actor MLXModelRuntime {
         /// Test seam: identifier of `residency`'s live reservation ticket, if any.
         func reservationTicketID(for residency: MLXModelResidency) -> UUID? {
             reservationTickets[residency]?.id
-        }
-
-        /// Whether `name` is already loaded in `residency` — lets a load that must not download skip
-        /// its on-disk check for a model that's already in memory.
-        func isResident(name: String, in residency: MLXModelResidency) -> Bool {
-            loadedContainers[residency] != nil && loadedModelNames[residency] == name
         }
 
         /// Test seam: slots currently holding a reservation.

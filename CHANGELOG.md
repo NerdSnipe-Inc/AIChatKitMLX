@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-27
+
+### Fixed
+- **`loadModel(downloadIfNeeded: false)` failed to compile in a Release build.** The `isResident` check it depends
+  on (added in 1.4.0) was accidentally scoped inside an `#if DEBUG` block meant only for test seams. Any consumer
+  archiving a Release build while using this method — new in 1.4.0 — hit "value of type 'MLXModelRuntime' has no
+  member 'isResident'". `swift test`/`xcodebuild test` always run Debug, so this was invisible until an actual
+  Release archive. `isResident` now compiles in both configurations; the remaining test-seam accessors stay
+  `#if DEBUG`-only.
+
+### Upgrading from 1.4.0
+- Required if you call `loadModel(downloadIfNeeded: false)` (AICompleteChat's `AppEnvironment`, and anything
+  following the "Adopt `MLXModelManager` for downloads" guidance in the 1.4.0 notes) and ship a Release/Archive
+  build. No code changes.
+
 ## [1.4.0] - 2026-09-27
 
 Model downloads get a single owner, and Gemma tool calls written as text are recovered at stream level.
