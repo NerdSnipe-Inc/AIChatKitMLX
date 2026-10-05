@@ -17,7 +17,13 @@ Adds on-device Apple MLX inference to any app already using [AIChatKit](https://
 > **Requires AIChatKit.** Add both packages to your target.  
 > Do not add this target to builds that must run on Intel Macs or Simulator.
 
+Prefer GGUF models? [AIChatKitLlama](https://github.com/NerdSnipe-Inc/AIChatKitLlama) is the sibling package: any GGUF model via llama.cpp, in-process on Metal, behind the same AIChatKit protocol.
+
 ---
+
+[![Sponsor NerdSnipe-Inc](https://img.shields.io/badge/Sponsor-NerdSnipe--Inc-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/NerdSnipe-Inc)
+
+> AIChatKitMLX is free and open source. If it saved you time, [sponsoring NerdSnipe Inc](https://github.com/sponsors/NerdSnipe-Inc) pays for the maintenance, bug fixes and new releases that keep it working.
 
 ## Installation
 
@@ -193,3 +199,10 @@ The cache is shared with the Python `huggingface_hub` library — models already
 ## License
 
 MIT
+
+## Support this project
+
+AIChatKitMLX is built and maintained by [NerdSnipe Inc](https://nerdsnipe.cc), a small independent studio in Ottawa. Sponsorship funds keeping up with Apple and MLX releases.
+
+- [Sponsor on GitHub](https://github.com/sponsors/NerdSnipe-Inc), from $5/month or a one-time amount
+- [More about what we fund](https://nerdsnipe.cc/sponsor)
