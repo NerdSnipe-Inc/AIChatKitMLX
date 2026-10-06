@@ -5,6 +5,11 @@ import Foundation
 /// Values use Gemma's `<|"|>string<|"|>` quoting (also tolerated: JSON `"..."` strings and the
 /// `<escape>` delimiter), bare numbers / booleans / null, nested objects and arrays. String
 /// contents are opaque — braces, commas and quotes inside them never affect structure.
+///
+/// A string delimiter can only *open* a string where a value or key may start (start of the body, or
+/// right after `:` `,` `[` `{`). One that follows a bare token (`limit:5<|"|>`) is a model slip: it is
+/// skipped, and stripped from the token, so the call still runs with the intended arguments instead of
+/// being dropped. Fine-tuned Gemma 4 produced exactly this in training run5.
 enum GemmaCallSyntax {
 
     static let quote = #"<|"|>"#
@@ -102,6 +107,10 @@ enum GemmaCallSyntax {
         var depth = 0
         var i = open
         while i < text.endIndex {
+            if text[i...].hasPrefix(quote), isStrayDelimiter(in: text, at: i) {
+                i = text.index(i, offsetBy: quote.count)
+                continue
+            }
             if let end = skipString(in: text, at: i) {
                 switch end {
                 case .some(let next): i = next; continue
@@ -117,6 +126,18 @@ enum GemmaCallSyntax {
             i = text.index(after: i)
         }
         return nil
+    }
+
+    /// Whether the quote delimiter at `i` cannot open a string because the previous significant
+    /// character is part of a bare value (or a closing bracket) rather than a `:` `,` `[` `{`.
+    static func isStrayDelimiter(in text: String, at i: String.Index) -> Bool {
+        var j = i
+        while j > text.startIndex {
+            j = text.index(before: j)
+            if text[j].isWhitespace { continue }
+            return !":,[{".contains(text[j])
+        }
+        return false
     }
 
     /// If a string literal starts at `i`, returns `.some(indexAfterIt)` or `.some(nil)` when it is
@@ -235,7 +256,9 @@ enum GemmaCallSyntax {
             // bare token up to , } ]
             let start = i
             while i < text.endIndex, !",}]".contains(text[i]) { i = text.index(after: i) }
-            let raw = text[start..<i].trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = text[start..<i]
+                .replacingOccurrences(of: GemmaCallSyntax.quote, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             if raw.isEmpty { return nil }
             switch raw {
             case "true": return true

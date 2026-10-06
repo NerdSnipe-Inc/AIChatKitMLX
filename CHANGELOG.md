@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-06
+
+### Fixed
+- **LoRA adapters trained with mlx-lm's default keys now load on Gemma 4.** `LoRAContainer.load(into:)` only
+  adapts the modules a model's `loraLayers` exposes (Gemma 4: `self_attn`), so an adapter that also trains the
+  MLP and per-layer projections was rejected with "Unhandled keys lora_a/lora_b" — and with
+  `.optional` that meant a silent fall-back to the base model. `FullModelLoRA` now wraps exactly the linear
+  layers named in the adapter's tensors (same `y + scale * (x @ A) @ B` maths) and `unloadAdapter()` reverts them.
+- **Gemma call parser tolerates a stray string delimiter after a bare value** (`limit:5<|"|>`). The call used to be
+  dropped entirely; it now runs with the intended arguments. Real strings are unaffected.
+
+### Added
+- `MLXProvider.adapterStatus` (`.notConfigured` / `.pending` / `.active` / `.unavailable(reason:)`), an
+  `adapterStatusHandler:` init parameter that is called on every change, and `retryAdapter()`. A failed adapter is
+  reported once per model load instead of being retried and re-logged on every request.
+
 ## [1.4.1] - 2026-09-27
 
 ### Fixed

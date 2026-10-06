@@ -427,6 +427,21 @@ public actor MLXProvider: ChatProvider {
         case required
     }
 
+    /// Whether the LoRA adapter is actually applied to the loaded model. With `.optional` a failed
+    /// adapter silently degrades to the base model; this is how a host app finds out so it can tell
+    /// the user and offer a fix instead of leaving them on the untuned model without knowing.
+    public enum AdapterStatus: Sendable, Equatable {
+        /// No adapter was requested for this provider.
+        case notConfigured
+        /// An adapter is configured but has not been applied yet (it loads with the model, on first use).
+        case pending
+        /// The adapter is applied to the loaded model.
+        case active
+        /// The adapter could not be applied; the base model is being used. `reason` is the underlying
+        /// error's description, for display or diagnostics.
+        case unavailable(reason: String)
+    }
+
     // MARK: - Model selection
 
     /// Small text-only model — fits on any Apple Silicon device (≥ 8 GB RAM).
@@ -475,6 +490,12 @@ public actor MLXProvider: ChatProvider {
     /// `nil` when the adapter was applied through `LoRAContainer.load(into:)`.
     private var loadedAdapterPaths:             [String]?
     private var isLoadingAdapter = false
+    /// Model revision for which applying the adapter already failed, so a deterministic failure is
+    /// reported once instead of being retried (and re-logged) on every request.
+    private var adapterFailedRevision:          UInt64?
+    /// Current adapter state; read it with `await`. Changes are also pushed to `adapterStatusHandler`.
+    public private(set) var adapterStatus:      AdapterStatus
+    nonisolated private let adapterStatusHandler: (@Sendable (AdapterStatus) -> Void)?
     nonisolated let adapterDirectoryURL: URL? // internal: exposed for @testable access in tests
     nonisolated private let adapterLoadingPolicy: AdapterLoadingPolicy
 
@@ -496,6 +517,7 @@ public actor MLXProvider: ChatProvider {
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     ///   - enableThinking: Whether Gemma may emit its private thought channel. Defaults to
     ///     `false` so local reasoning is never generated unless a caller explicitly opts in.
+    ///   - adapterStatusHandler: Called whenever ``adapterStatus`` changes (from any thread).
     public init(
         modelId: String = MLXProvider.defaultModelId,
         adapterDirectoryURL: URL? = nil,
@@ -505,8 +527,11 @@ public actor MLXProvider: ChatProvider {
         temperature: Float = 0.6,
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil,
-        enableThinking: Bool = false
+        enableThinking: Bool = false,
+        adapterStatusHandler: (@Sendable (AdapterStatus) -> Void)? = nil
     ) {
+        self.adapterStatusHandler = adapterStatusHandler
+        self.adapterStatus = adapterDirectoryURL == nil ? .notConfigured : .pending
         self.configuration = ModelConfiguration(id: modelId)
         self.hubModelId = modelId
         self.adapterDirectoryURL = adapterDirectoryURL
@@ -535,6 +560,7 @@ public actor MLXProvider: ChatProvider {
     ///   - repetitionPenalty: Optional repetition penalty applied during decoding.
     ///   - enableThinking: Whether Gemma may emit its private thought channel. Defaults to
     ///     `false` so local reasoning is never generated unless a caller explicitly opts in.
+    ///   - adapterStatusHandler: Called whenever ``adapterStatus`` changes (from any thread).
     public init(
         modelPath: URL,
         adapterDirectoryURL: URL? = nil,
@@ -544,8 +570,11 @@ public actor MLXProvider: ChatProvider {
         temperature: Float = 0.6,
         topP: Float = 1.0,
         repetitionPenalty: Float? = nil,
-        enableThinking: Bool = false
+        enableThinking: Bool = false,
+        adapterStatusHandler: (@Sendable (AdapterStatus) -> Void)? = nil
     ) {
+        self.adapterStatusHandler = adapterStatusHandler
+        self.adapterStatus = adapterDirectoryURL == nil ? .notConfigured : .pending
         self.configuration = ModelConfiguration(directory: modelPath)
         self.hubModelId = nil
         self.adapterDirectoryURL = adapterDirectoryURL
@@ -678,6 +707,7 @@ public actor MLXProvider: ChatProvider {
             loadedAdapter = nil
             loadedAdapterRevision = nil
             loadedAdapterPaths = nil
+            if adapterFailedRevision != revision, adapterDirectoryURL != nil { setAdapterStatus(.pending) }
         }
 
         guard let url = adapterDirectoryURL else {
@@ -689,12 +719,14 @@ public actor MLXProvider: ChatProvider {
             return container
         }
 
-        if loadedAdapter == nil, !isLoadingAdapter {
+        if loadedAdapter == nil, !isLoadingAdapter, adapterFailedRevision != revision || adapterLoadingPolicy == .required {
             isLoadingAdapter = true
             defer { isLoadingAdapter = false }
             do {
                 try await loadAdapter(at: url)
             } catch {
+                adapterFailedRevision = revision
+                setAdapterStatus(.unavailable(reason: error.localizedDescription))
                 if adapterLoadingPolicy == .required { throw error }
                 ChatLog.warning(.model, "Adapter load failed (using base model): \(error.localizedDescription)")
             }
@@ -895,7 +927,34 @@ public actor MLXProvider: ChatProvider {
             for: configuration,
             residency: residency
         )
+        adapterFailedRevision = nil
+        setAdapterStatus(.active)
         ChatLog.info(.model, "Adapter loaded from \(path.lastPathComponent)")
+    }
+
+    /// Tries again to apply the configured adapter after a failure, without reloading the base model.
+    /// Does nothing if no adapter is configured. If the model is not resident yet the adapter simply
+    /// loads with it on the next request. The outcome is in ``adapterStatus``.
+    public func retryAdapter() async {
+        guard let url = adapterDirectoryURL else { return }
+        adapterFailedRevision = nil
+        guard await MLXModelRuntime.shared.loadedContainer(for: configuration, residency: residency) != nil else {
+            setAdapterStatus(.pending)
+            return
+        }
+        do {
+            try await loadAdapter(at: url)
+        } catch {
+            adapterFailedRevision = await MLXModelRuntime.shared.revision(for: configuration, residency: residency)
+            setAdapterStatus(.unavailable(reason: error.localizedDescription))
+            ChatLog.warning(.model, "Adapter retry failed (using base model): \(error.localizedDescription)")
+        }
+    }
+
+    private func setAdapterStatus(_ status: AdapterStatus) {
+        guard status != adapterStatus else { return }
+        adapterStatus = status
+        adapterStatusHandler?(status)
     }
 
     /// Unloads the currently active LoRA adapter, if any.
@@ -917,6 +976,7 @@ public actor MLXProvider: ChatProvider {
         loadedAdapter = nil
         loadedAdapterRevision = nil
         loadedAdapterPaths = nil
+        setAdapterStatus(.pending)
         ChatLog.info(.model, "Adapter unloaded")
     }
 

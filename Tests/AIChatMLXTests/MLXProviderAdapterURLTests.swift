@@ -31,3 +31,37 @@ final class MLXProviderAdapterURLTests: XCTestCase {
         XCTAssertEqual(provider.adapterDirectoryURL, adapterURL)
     }
 }
+
+final class MLXProviderAdapterStatusTests: XCTestCase {
+    func test_noAdapter_isNotConfigured() async {
+        let provider = MLXProvider(modelId: "mlx-community/gemma-4-e4b-it-4bit")
+        let status = await provider.adapterStatus
+        XCTAssertEqual(status, .notConfigured)
+    }
+
+    func test_adapterURL_startsPending() async {
+        let provider = MLXProvider(
+            modelId: "mlx-community/gemma-4-e4b-it-4bit",
+            adapterDirectoryURL: URL(filePath: "/tmp/fake-adapter")
+        )
+        let status = await provider.adapterStatus
+        XCTAssertEqual(status, .pending)
+    }
+
+    func test_retryWithoutAdapter_isANoOp() async {
+        let provider = MLXProvider(modelId: "mlx-community/gemma-4-e4b-it-4bit")
+        await provider.retryAdapter()
+        let status = await provider.adapterStatus
+        XCTAssertEqual(status, .notConfigured)
+    }
+
+    func test_retryBeforeModelIsLoaded_staysPending() async {
+        let provider = MLXProvider(
+            modelPath: URL(filePath: "/tmp/definitely-not-a-model"),
+            adapterDirectoryURL: URL(filePath: "/tmp/fake-adapter")
+        )
+        await provider.retryAdapter()
+        let status = await provider.adapterStatus
+        XCTAssertEqual(status, .pending)
+    }
+}
