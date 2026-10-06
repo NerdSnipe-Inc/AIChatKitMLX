@@ -471,6 +471,9 @@ public actor MLXProvider: ChatProvider {
     nonisolated private let streamSyntax: StreamSyntax
     private var loadedAdapter:                  LoRAContainer?
     private var loadedAdapterRevision:          UInt64?
+    /// Linear-layer paths wrapped by `FullModelLoRA`, so `unloadAdapter()` can revert them.
+    /// `nil` when the adapter was applied through `LoRAContainer.load(into:)`.
+    private var loadedAdapterPaths:             [String]?
     private var isLoadingAdapter = false
     nonisolated let adapterDirectoryURL: URL? // internal: exposed for @testable access in tests
     nonisolated private let adapterLoadingPolicy: AdapterLoadingPolicy
@@ -674,6 +677,7 @@ public actor MLXProvider: ChatProvider {
         if loadedAdapterRevision != revision {
             loadedAdapter = nil
             loadedAdapterRevision = nil
+            loadedAdapterPaths = nil
         }
 
         guard let url = adapterDirectoryURL else {
@@ -875,10 +879,18 @@ public actor MLXProvider: ChatProvider {
         }
         if loadedAdapter != nil { try await unloadAdapter() }
         let adapter = try LoRAContainer.from(directory: path)
-        _ = try await container.perform { ctx in
+        // Adapters trained with mlx-lm's default keys (no explicit `keys` in adapter_config.json) are
+        // applied at the exact module paths in their tensors; the library loader would reject the
+        // MLP / per-layer projections of Gemma 4 because it only exposes `self_attn`.
+        let wrappedPaths: [String]? = try await container.perform { ctx in
+            if adapter.configuration.loraParameters.keys == nil {
+                return try FullModelLoRA.apply(adapter, to: ctx.model)
+            }
             try adapter.load(into: ctx.model)
+            return nil
         }
         loadedAdapter = adapter
+        loadedAdapterPaths = wrappedPaths
         loadedAdapterRevision = await MLXModelRuntime.shared.revision(
             for: configuration,
             residency: residency
@@ -894,11 +906,17 @@ public actor MLXProvider: ChatProvider {
                 residency: residency
               )
         else { return }
+        let wrappedPaths = loadedAdapterPaths
         _ = await container.perform { ctx in
-            adapter.unload(from: ctx.model)
+            if let wrappedPaths {
+                FullModelLoRA.revert(paths: wrappedPaths, in: ctx.model)
+            } else {
+                adapter.unload(from: ctx.model)
+            }
         }
         loadedAdapter = nil
         loadedAdapterRevision = nil
+        loadedAdapterPaths = nil
         ChatLog.info(.model, "Adapter unloaded")
     }
 
